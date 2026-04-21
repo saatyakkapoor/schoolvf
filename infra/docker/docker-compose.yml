@@ -1,0 +1,220 @@
+# Core services (no profile): postgres, redis, api, dashboard.
+# Optional profiles: storage (MinIO), vision (plate worker), monitoring (Prometheus + Grafana).
+# scripts/dev/start-all.sh enables storage + vision + monitoring by default.
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: schoolvf-postgres
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-schoolvf}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-schoolvf_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-schoolvf}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    networks:
+      - schoolvf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-schoolvf}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: schoolvf-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    command: redis-server --appendonly yes
+    networks:
+      - schoolvf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    profiles: ["storage"]
+    image: minio/minio:latest
+    container_name: schoolvf-minio
+    restart: unless-stopped
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - schoolvf
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ../../
+      dockerfile: infra/docker/Dockerfile.api
+    container_name: schoolvf-api
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-schoolvf}:${POSTGRES_PASSWORD:-schoolvf_secret}@postgres:5432/${POSTGRES_DB:-schoolvf}
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-snapshots}
+      MINIO_USE_SSL: "false"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      JWT_SECRET: ${JWT_SECRET:-schoolvf-dev-change-in-production}
+      AUTH_USERNAME: ${AUTH_USERNAME:-tsrs}
+      AUTH_PASSWORD: ${AUTH_PASSWORD:-TSRS@2026}
+      INTERNAL_INGEST_SECRET: ${INTERNAL_INGEST_SECRET:-dev-ingest-secret}
+      # MJPEG Live Monitor + seed default exit camera RTSP; entry default via ENTRY_CAMERA_RTSP_DEFAULT
+      CAMERA_RTSP_URL: ${CAMERA_RTSP_URL:-rtsp://admin:abcd%401234@192.168.1.12:554/Streaming/Channels/101}
+      ENTRY_CAMERA_RTSP_DEFAULT: ${ENTRY_CAMERA_RTSP_DEFAULT:-rtsp://example/entry}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+      start_period: 60s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../../storage:/app/storage
+    networks:
+      - schoolvf
+
+  vision-worker:
+    profiles: ["vision"]
+    build:
+      context: ../../
+      dockerfile: infra/docker/Dockerfile.vision
+    container_name: schoolvf-vision-worker
+    restart: unless-stopped
+    environment:
+      PYTHONPATH: /app
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-schoolvf}:${POSTGRES_PASSWORD:-schoolvf_secret}@postgres:5432/${POSTGRES_DB:-schoolvf}
+      REDIS_URL: redis://redis:6379/0
+      API_BASE_URL: http://api:8000
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-snapshots}
+      MINIO_USE_SSL: "false"
+      SNAPSHOT_STORAGE_PATH: /app/storage/snapshots
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      INTERNAL_INGEST_SECRET: ${INTERNAL_INGEST_SECRET:-dev-ingest-secret}
+      # Poll API for all active cameras (entry + exit); no dashboard required. Use single-camera mode only if needed.
+      VISION_CAMERA_SOURCE: ${VISION_CAMERA_SOURCE:-api}
+      CAMERA_POLL_INTERVAL_SEC: ${CAMERA_POLL_INTERVAL_SEC:-25}
+      # Optional single-camera fallback when VISION_CAMERA_SOURCE=single
+      CAMERA_ID: ${CAMERA_ID:-cam-exit-1}
+      CAMERA_NAME: ${CAMERA_NAME:-Exit gate — Main}
+      CAMERA_RTSP_URL: ${CAMERA_RTSP_URL:-rtsp://admin:abcd%401234@192.168.1.12:554/Streaming/Channels/101}
+      PLATE_ENGINE: ${PLATE_ENGINE:-live}
+      PLATE_FILTER: ${PLATE_FILTER:-indian}
+      VISION_STACK: ${VISION_STACK:-rapid}
+      PLATE_STAGE: ${PLATE_STAGE:-recognition}
+      PLATE_DETECT_MIN_QUALITY_FOR_OCR: ${PLATE_DETECT_MIN_QUALITY_FOR_OCR:-0.05}
+      PLATE_USE_HEURISTIC_BANDS: ${PLATE_USE_HEURISTIC_BANDS:-false}
+      SAMPLE_EASY_OCR_FULLFRAME_FALLBACK: ${SAMPLE_EASY_OCR_FULLFRAME_FALLBACK:-true}
+      MIN_CONFIDENCE: ${MIN_CONFIDENCE:-0.16}
+      OCR_GPU: ${OCR_GPU:-false}
+      PLATE_DETECTION_MODE: ${PLATE_DETECTION_MODE:-opencv_roi}
+      # 0 = no artificial delay between frames (limited by OCR/YOLO speed only)
+      PROCESS_INTERVAL_SEC: ${PROCESS_INTERVAL_SEC:-0}
+      RTSP_GRAB_DRAIN: ${RTSP_GRAB_DRAIN:-1}
+      HTTP_POST_WORKERS: ${HTTP_POST_WORKERS:-16}
+      DEDUPE_SECONDS: ${DEDUPE_SECONDS:-4}
+      CAMERA_COOLDOWN_SEC: ${CAMERA_COOLDOWN_SEC:-15}
+      # Use all cores allocated to the container (raise if you give Docker more CPUs)
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-16}
+      OPENBLAS_NUM_THREADS: ${OPENBLAS_NUM_THREADS:-16}
+      MKL_NUM_THREADS: ${MKL_NUM_THREADS:-16}
+      NUMEXPR_NUM_THREADS: ${NUMEXPR_NUM_THREADS:-16}
+      TORCH_NUM_THREADS: ${TORCH_NUM_THREADS:-16}
+      OPENCV_NUM_THREADS: ${OPENCV_NUM_THREADS:-16}
+      LIVE_SNAPSHOT_JPEG_QUALITY: ${LIVE_SNAPSHOT_JPEG_QUALITY:-75}
+    volumes:
+      - ../../storage:/app/storage
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - schoolvf
+
+  dashboard:
+    build:
+      context: ../../
+      dockerfile: infra/docker/Dockerfile.dashboard
+    container_name: schoolvf-dashboard
+    restart: unless-stopped
+    ports:
+      - "${DASHBOARD_PORT:-3000}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - schoolvf
+
+  prometheus:
+    profiles: ["monitoring"]
+    image: prom/prometheus:latest
+    container_name: schoolvf-prometheus
+    restart: unless-stopped
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ../prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+    networks:
+      - schoolvf
+
+  grafana:
+    profiles: ["monitoring"]
+    image: grafana/grafana:latest
+    container_name: schoolvf-grafana
+    restart: unless-stopped
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - ../grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - schoolvf
+
+volumes:
+  postgres_data:
+    driver: local
+  minio_data:
+    driver: local
+
+networks:
+  schoolvf:
+    driver: bridge

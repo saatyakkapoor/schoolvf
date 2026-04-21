@@ -1,0 +1,9 @@
+numpy>=1.24,<3
+opencv-python-headless>=4.8,<5
+pydantic-settings>=2,<3
+httpx>=0.27,<1
+onnxruntime>=1.16,<2
+rapidocr-onnxruntime>=1.3,<2
+# sample.txt stack (YOLO + EasyOCR) — install CPU torch in Docker before this file
+ultralytics>=8.0,<9
+easyocr>=1.7,<2

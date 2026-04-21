@@ -1,0 +1,39 @@
+FROM public.ecr.aws/docker/library/python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies required by OpenCV
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxrender1 \
+        libxext6 \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# sample.txt stack: CPU PyTorch first, then ultralytics + easyocr + rest
+COPY apps/vision-worker/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Copy shared packages
+COPY packages/__init__.py /app/packages/__init__.py
+COPY packages/shared /app/packages/shared
+
+# Legacy name shadowed stdlib `types` (enum, dataclasses, etc.). Package is `svf_types` now.
+RUN rm -rf /app/packages/shared/types
+
+# Copy vision worker (underscore path for valid Python package name)
+COPY apps/__init__.py /app/apps/__init__.py
+COPY apps/vision-worker /app/apps/vision_worker
+# Optional: plate-only YOLO weights in apps/vision-worker/models/ (not vehicle COCO models)
+
+# Monorepo root only — never add /app/packages/shared alone (shadows stdlib names).
+ENV PYTHONPATH="/app"
+
+# Create storage directories
+RUN mkdir -p /app/storage/snapshots /app/storage/spool
+
+CMD ["python", "-m", "apps.vision_worker.app.main"]

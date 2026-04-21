@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# Node
+node_modules/
+apps/dashboard/dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Storage
+storage/snapshots/*
+storage/spool/*
+storage/users.json
+storage/vehicles.json
+!storage/snapshots/.gitkeep
+!storage/spool/.gitkeep
+
+# Docker volumes
+infra/docker/postgres-data/
+infra/docker/minio-data/
+infra/docker/grafana-data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models
+*.pt
+*.onnx
+*.pth
+
+# Logs
+*.log
+logs/

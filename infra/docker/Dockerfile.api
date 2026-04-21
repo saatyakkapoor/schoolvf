@@ -1,0 +1,40 @@
+# Public ECR mirrors Docker Hub — avoids registry-1.docker.io TLS timeouts for some networks.
+# ---------- Stage 1: Builder ----------
+FROM public.ecr.aws/docker/library/python:3.11-slim AS builder
+
+WORKDIR /build
+
+COPY apps/api/requirements.txt ./requirements.txt
+
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# ---------- Stage 2: Runtime ----------
+FROM public.ecr.aws/docker/library/python:3.11-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN mkdir -p /app/storage
+
+# Copy installed Python packages from builder
+COPY --from=builder /install /usr/local
+
+# Copy shared packages
+COPY packages/__init__.py /app/packages/__init__.py
+COPY packages/shared /app/packages/shared
+
+RUN rm -rf /app/packages/shared/types
+
+# Copy API application code
+COPY apps/__init__.py /app/apps/__init__.py
+COPY apps/api /app/apps/api
+
+# Set PYTHONPATH so imports resolve across the monorepo
+# Do not add /app/packages/shared alone — it shadows stdlib top-level names (logging, etc.).
+ENV PYTHONPATH="/app:/app/apps/api"
+
+EXPOSE 8000
+
+CMD ["uvicorn", "apps.api.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
