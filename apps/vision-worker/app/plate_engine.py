@@ -285,19 +285,20 @@ def _merge_two_line_plates(result: list) -> list:
     # Sort all boxes top-to-bottom
     sorted_lines = sorted(result, key=_cy)
 
-    # Median height → clustering radius (boxes within 1.5× median height share a row)
-    heights = [_height(l) for l in sorted_lines]
-    med_h = sorted(heights)[len(heights) // 2] if heights else 20.0
-    cluster_radius = max(med_h * 1.5, 8.0)
-
     # --- Step 1: cluster into horizontal rows ---
+    # Use EACH LINE'S OWN height as the clustering radius — never the median.
+    # If we used the median, one large text element in the frame (a sign, OSD,
+    # building label) would inflate the radius and merge both plate lines into
+    # one row, destroying the two-line split we actually need.
     rows: list[list] = []
     for line in sorted_lines:
         cy = _cy(line)
+        h = _height(line)
+        radius = max(h * 1.0, 8.0)   # within 1× own height → same row
         placed = False
         for row in rows:
             row_cy = sum(_cy(l) for l in row) / len(row)
-            if abs(cy - row_cy) < cluster_radius:
+            if abs(cy - row_cy) < radius:
                 row.append(line)
                 placed = True
                 break
@@ -316,10 +317,26 @@ def _merge_two_line_plates(result: list) -> list:
         row_texts.append((text, conf))
 
     # --- Step 3: try merging adjacent rows into valid plates ---
+    # Pre-compute the Y-centre of each row so we can gate on proximity.
+    row_cy_list: list[float] = []
+    for row in rows:
+        row_cy_list.append(sum(_cy(l) for l in row) / len(row))
+
+    # Typical two-line plate: row centres are separated by ≤ 3× a single line height.
+    # This stops us merging text from two buses that happen to both be in the frame.
+    row_heights: list[float] = []
+    for row in rows:
+        row_heights.append(max(_height(l) for l in row))
+
     extra = list(result)
     dummy_bbox = result[0][0] if result and result[0] else []
     for i in range(len(row_texts) - 1):
         for j in range(i + 1, min(i + 3, len(row_texts))):
+            # Proximity gate: rows must be within 4× the taller row's height
+            gap = abs(row_cy_list[j] - row_cy_list[i])
+            max_h = max(row_heights[i], row_heights[j], 1.0)
+            if gap > max_h * 4.0:
+                continue  # rows are too far apart — different objects
             ta, ca = row_texts[i]
             tb, cb = row_texts[j]
             combined = ta + tb

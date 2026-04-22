@@ -49,6 +49,9 @@ _DIGIT_TO_LETTER: dict[str, str] = {
     "5": "S",
     "6": "G",
     "2": "Z",
+    "4": "A",  # Indian bus plates at distance: "4" ↔ "A" confusion is common
+    "3": "B",  # "3" ↔ "B" / "8" at low resolution
+    "7": "T",  # "7" ↔ "T" — narrow strokes look identical at distance
 }
 
 # Letter-to-letter visual confusions (low-resolution / distant cameras).
@@ -137,7 +140,10 @@ def validate_and_correct_indian(norm: str) -> str | None:
     if not norm:
         return None
     n = len(norm)
-    if n < 5 or n > 12:
+    # Real Indian bus/car plates are 6–12 chars (e.g. MH12AB1234 = 10, DL1C1234 = 8).
+    # 5-char strings like "HR554" are almost always the first line of a two-line plate
+    # that hasn't been merged yet — rejecting them forces the two-line merger to win.
+    if n < 6 or n > 12:
         return None
 
     # Layer 1: fast path — regex match AND valid state code
