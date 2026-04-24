@@ -519,6 +519,77 @@ def _detect_vehicles_and_read_plates(
     return [(p, merged[p]) for p in sorted(merged)]
 
 
+def _ocr_plate_crop(
+    frame: "NDArray[np.uint8]",
+    x1: int, y1: int, x2: int, y2: int,
+    *,
+    fh: int, fw: int,
+    label: str,
+    ocr: object,
+    merged: "dict[str, float]",
+    min_confidence: float,
+    strict_indian: bool,
+) -> None:
+    """
+    OCR a plate-region crop and accumulate validated plates into `merged`.
+
+    Two crops are attempted for every bounding box:
+      A) Tight crop  — original bbox with small padding.
+         Good for single-line plates that YOLO framed correctly.
+      B) Extended crop — same top, bottom pushed down by 100% of box height.
+         Captures the SECOND line of two-line Indian bus plates when YOLO only
+         detected the first line (which it was trained on).
+
+    Each crop is CLAHE-enhanced + 3× upscaled before OCR.
+    `_merge_two_line_plates` inside `_parse_rapid_result` then reassembles
+    the two rows into one valid plate string.
+    """
+    def _enhance_and_ocr(cy1: int, cy2: int) -> list:
+        cy1 = max(0, cy1)
+        cy2 = min(fh, cy2)
+        if cy2 - cy1 < 6:
+            return []
+        crop = frame[cy1:cy2, x1:x2].copy()
+        if crop.size == 0:
+            return []
+        try:
+            lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+            lc, ac, bc = cv2.split(lab)
+            lc = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4)).apply(lc)
+            crop = cv2.cvtColor(cv2.merge([lc, ac, bc]), cv2.COLOR_LAB2BGR)
+        except Exception:
+            pass
+        h_c, w_c = crop.shape[:2]
+        crop = cv2.resize(crop, (w_c * 3, h_c * 3), interpolation=cv2.INTER_LANCZOS4)
+        result, _ = ocr(crop)  # type: ignore[operator]
+        return result or []
+
+    plate_h = y2 - y1
+
+    # Crop A: tight (single-line plate)
+    result_a = _enhance_and_ocr(y1, y2)
+    if result_a:
+        texts = [(str(ln[1]).strip(), round(float(ln[2]), 3)) for ln in result_a if len(ln) >= 3]
+        log.info("%s tight OCR: %s", label, texts[:8])
+    for plate, score in _parse_rapid_result(
+        result_a, min_confidence=max(0.05, min_confidence - 0.04),
+        strict_indian=strict_indian, debug_label=f"{label}-tight",
+    ):
+        merged[plate] = max(merged.get(plate, 0.0), score)
+
+    # Crop B: extended downward — two-line plate (2nd line below YOLO box)
+    y2_ext = y2 + plate_h          # push bottom down by one full plate height
+    result_b = _enhance_and_ocr(y1, y2_ext)
+    if result_b:
+        texts = [(str(ln[1]).strip(), round(float(ln[2]), 3)) for ln in result_b if len(ln) >= 3]
+        log.info("%s ext OCR: %s", label, texts[:8])
+    for plate, score in _parse_rapid_result(
+        result_b, min_confidence=max(0.05, min_confidence - 0.04),
+        strict_indian=strict_indian, debug_label=f"{label}-ext",
+    ):
+        merged[plate] = max(merged.get(plate, 0.0), score)
+
+
 def read_plates_from_frame(
     frame: "NDArray[np.uint8]",
     *,
@@ -530,12 +601,15 @@ def read_plates_from_frame(
     vision_stack: str | None = None,
 ) -> list[tuple[str, float]]:
     """
-    Three-step pipeline (sample.txt approach):
-      1. license_plate_detector.pt  → YOLO finds plate bbox in frame
-      2. Colour crop + CLAHE + 3× upscale  → contrast-boosted plate image
-      3. RapidOCR  → read text
+    Two-step pipeline:
+      1. license_plate_detector.pt YOLO  →  each detected bbox gets TWO OCR crops:
+            - tight crop  (single-line plate)
+            - extended-down crop (two-line plate: 2nd line lives below the YOLO box)
+      2. OpenCV contour scan fallback (only when YOLO finds nothing)
 
-    If YOLO finds nothing, falls back to OpenCV contour scan + zone scan.
+    The zone scan (full-frame OCR) has been intentionally removed — it picked up
+    building signs, OSD text, road markings and caused constant false positives.
+    All real plates are found by YOLO or contour scan on actual plate-shaped regions.
     """
     stack = (vision_stack or "").strip().lower()
     if not stack:
@@ -548,15 +622,16 @@ def read_plates_from_frame(
         except Exception as e:
             log.warning("sample stack failed, using rapid: %s", e)
 
+    import os
+    from pathlib import Path
+
     ocr = _get_ocr()
     merged: dict[str, float] = {}
+    fh, fw = frame.shape[:2]
 
     # ── Step 1: YOLO plate detector ──────────────────────────────────────────
-    # license_plate_detector.pt directly finds plate regions.
-    # This is the same model+approach that worked in sample.txt.
+    yolo_hit = False
     try:
-        import os
-        from pathlib import Path
         _models_dir = Path(__file__).resolve().parent.parent / "models"
         _plate_pt = _models_dir / "license_plate_detector.pt"
         if _plate_pt.is_file():
@@ -568,46 +643,41 @@ def read_plates_from_frame(
 
             yolo = read_plates_from_frame._plate_yolo  # type: ignore[attr-defined]
             device = (os.environ.get("YOLO_DEVICE") or "cpu").strip()
-            fh, fw = frame.shape[:2]
 
-            # Run YOLO on 2× upscaled frame so distant/small plates cross the detection threshold
+            # Run on 2× upscaled frame so small/distant plates cross detection threshold.
+            # conf=0.08 — lower than default but not so low that every rectangle fires.
             frame_up = cv2.resize(frame, (fw * 2, fh * 2), interpolation=cv2.INTER_LINEAR)
-            results = yolo(frame_up, conf=0.03, iou=0.4, device=device, verbose=False)
+            results = yolo(frame_up, conf=0.08, iou=0.4, device=device, verbose=False)
 
             if results and results[0].boxes is not None and len(results[0].boxes):
-                log.info("plate YOLO: %d boxes found", len(results[0].boxes))
+                log.info("plate YOLO: %d box(es)", len(results[0].boxes))
+                yolo_hit = True
                 for box in results[0].boxes:
                     # Coords are in 2× space — map back to original frame
                     x1, y1, x2, y2 = (int(v / 2) for v in box.xyxy[0].cpu().numpy())
                     conf_det = float(box.conf[0].cpu().numpy())
 
-                    # Clamp + skip tiny / OSD
+                    # Small padding
                     x1, y1 = max(0, x1 - 6), max(0, y1 - 4)
                     x2, y2 = min(fw, x2 + 6), min(fh, y2 + 4)
-                    if (x2 - x1) < 30 or (y2 - y1) < 10:
+
+                    # Skip tiny boxes (noise) and OSD strips
+                    if (x2 - x1) < 30 or (y2 - y1) < 8:
                         continue
                     cy = (y1 + y2) / 2
                     if cy < fh * _OSD_TOP_FRAC or cy > fh * (1 - _OSD_BOT_FRAC):
                         continue
 
-                    # Colour crop → CLAHE → 3× upscale
-                    crop = frame[y1:y2, x1:x2].copy()
-                    try:
-                        lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
-                        l, a, b = cv2.split(lab)
-                        l = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4)).apply(l)
-                        crop = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
-                    except Exception:
-                        pass
-                    h_c, w_c = crop.shape[:2]
-                    crop = cv2.resize(crop, (w_c * 3, h_c * 3), interpolation=cv2.INTER_LANCZOS4)
-
-                    result, _ = ocr(crop)
-                    if result:
-                        texts = [(str(l[1]).strip(), round(float(l[2]), 3)) for l in result if len(l) >= 3]
-                        log.info("plate YOLO box (%d,%d,%d,%d) det_conf=%.2f OCR: %s", x1, y1, x2, y2, conf_det, texts)
-                    for plate, score in _parse_rapid_result(result, min_confidence=max(0.05, min_confidence - 0.04), strict_indian=strict_indian, debug_label="[yolo-plate]"):
-                        merged[plate] = max(merged.get(plate, 0.0), score)
+                    log.info("YOLO plate box (%d,%d,%d,%d) conf=%.2f", x1, y1, x2, y2, conf_det)
+                    _ocr_plate_crop(
+                        frame, x1, y1, x2, y2,
+                        fh=fh, fw=fw,
+                        label=f"[yolo@{conf_det:.2f}]",
+                        ocr=ocr,
+                        merged=merged,
+                        min_confidence=min_confidence,
+                        strict_indian=strict_indian,
+                    )
             else:
                 log.info("plate YOLO: no boxes this frame")
     except Exception as exc:
@@ -616,23 +686,20 @@ def read_plates_from_frame(
     if merged:
         return [(p, merged[p]) for p in sorted(merged)]
 
-    # ── Step 2: OpenCV contour scan (fallback) ───────────────────────────────
-    for rx, ry, rw, rh, _ in _iter_opencv_plate_rois(frame, max_rois=max_roi):
-        crop = frame[ry:ry + rh, rx:rx + rw].copy()
-        if crop.size == 0:
-            continue
-        scale = max(1.0, 300 / max(rw, 1))
-        crop = cv2.resize(crop, (int(rw * scale), int(rh * scale)), interpolation=cv2.INTER_LANCZOS4)
-        result, _ = ocr(crop)
-        if result:
-            texts = [(str(l[1]).strip(), round(float(l[2]), 3)) for l in result if len(l) >= 3]
-            log.info("contour ROI (%d,%d,%d,%d) texts: %s", rx, ry, rw, rh, texts[:8])
-        for plate, score in _parse_rapid_result(result, min_confidence=min_confidence, strict_indian=strict_indian, debug_label="[contour]"):
-            merged[plate] = max(merged.get(plate, 0.0), score)
-
-    # ── Step 3: Zone scan (last resort) ─────────────────────────────────────
-    if not merged:
-        _add_fullframe_results(frame, merged, min_confidence, strict_indian)
+    # ── Step 2: OpenCV contour scan (only when YOLO found nothing) ───────────
+    # Contour scan finds plate-shaped rectangular edges in the image.
+    # It does NOT scan the whole frame — only tight ROIs around candidate rectangles.
+    if not yolo_hit:
+        for rx, ry, rw, rh, _ in _iter_opencv_plate_rois(frame, max_rois=max_roi):
+            _ocr_plate_crop(
+                frame, rx, ry, rx + rw, ry + rh,
+                fh=fh, fw=fw,
+                label="[contour]",
+                ocr=ocr,
+                merged=merged,
+                min_confidence=min_confidence,
+                strict_indian=strict_indian,
+            )
 
     return [(p, merged[p]) for p in sorted(merged)]
 

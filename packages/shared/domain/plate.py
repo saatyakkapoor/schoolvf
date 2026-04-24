@@ -49,9 +49,7 @@ _DIGIT_TO_LETTER: dict[str, str] = {
     "5": "S",
     "6": "G",
     "2": "Z",
-    "4": "A",  # Indian bus plates at distance: "4" ↔ "A" confusion is common
-    "3": "B",  # "3" ↔ "B" / "8" at low resolution
-    "7": "T",  # "7" ↔ "T" — narrow strokes look identical at distance
+    "4": "A",  # Indian plate fonts: "4" ↔ "A" confusion at distance
 }
 
 # Letter-to-letter visual confusions (low-resolution / distant cameras).
