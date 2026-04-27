@@ -32,7 +32,7 @@ _OSD_BOT_FRAC = 0.16    # bottom 16% of frame height (Hikvision camera name — 
 # ---------------------------------------------------------------------------
 # COCO class IDs for vehicles (only used when running a COCO-pretrained model)
 _COCO_VEHICLE_CLASSES = {2, 3, 5, 7}  # 2=car, 3=motorcycle, 5=bus, 7=truck
-_VEHICLE_CONF = 0.25  # confidence threshold (lowered from 0.30 — school buses can be low-conf)
+_VEHICLE_CONF = 0.18  # lowered further — distant/blurry buses still need to be caught
 
 _YOLO_AVAILABLE = False
 try:
@@ -108,7 +108,29 @@ class VehicleDetector:
             try:
                 self._model = _YOLO(self._model_path)
                 self._model.fuse()
-                # Log the model's class names so we know what it can detect
+                # Move to GPU + FP16 + warm up with a dummy call so the very
+                # first real frame doesn't pay the 1-2 s CUDA init cost.
+                try:
+                    import os as _os
+                    device = (_os.environ.get("YOLO_DEVICE") or "cpu").strip()
+                    half = _os.environ.get("YOLO_HALF", "0").lower() in ("1", "true", "yes")
+                    try:
+                        imgsz = int(_os.environ.get("YOLO_IMGSZ", "0") or "0")
+                    except ValueError:
+                        imgsz = 0
+                    if device.startswith("cuda"):
+                        self._model.to(device)
+                        if half:
+                            self._model.model.half()
+                        warm = np.zeros((imgsz or 640, imgsz or 640, 3), dtype=np.uint8)
+                        self._model(warm, conf=0.5, device=device, half=half,
+                                    imgsz=imgsz or 640, verbose=False)
+                        log.info(
+                            "VehicleDetector warmed up on %s (half=%s imgsz=%s)",
+                            device, half, imgsz or 640,
+                        )
+                except Exception as warm_exc:
+                    log.debug("VehicleDetector warmup skipped: %s", warm_exc)
                 names = getattr(self._model, "names", None)
                 log.warning(
                     "VehicleDetector LOADED: %s (coco=%s) classes=%s",

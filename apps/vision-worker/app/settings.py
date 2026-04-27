@@ -9,11 +9,11 @@ from pydantic_settings import BaseSettings
 def _detect_default_yolo_device() -> str:
     """
     Pick the best available compute device automatically.
-    Honours YOLO_DEVICE env var if set (e.g. cuda:0, cpu, mps).
+    Honours YOLO_DEVICE env var if set (e.g. cuda:0, cpu, mps, auto).
     Falls back to CUDA when torch reports a working GPU; else CPU.
     """
     explicit = (os.environ.get("YOLO_DEVICE") or "").strip()
-    if explicit:
+    if explicit and explicit.lower() != "auto":
         return explicit
     try:
         import torch  # type: ignore
@@ -27,12 +27,13 @@ def _detect_default_yolo_device() -> str:
 
 
 def _detect_default_ocr_gpu() -> bool:
-    """EasyOCR / RapidOCR GPU defaults to ON when CUDA is reachable."""
+    """EasyOCR / RapidOCR GPU. 'auto' / unset → on when CUDA is reachable."""
     explicit = (os.environ.get("OCR_GPU") or "").strip().lower()
     if explicit in ("1", "true", "yes", "on"):
         return True
     if explicit in ("0", "false", "no", "off"):
         return False
+    # treat empty / 'auto' as auto-detect
     try:
         import torch  # type: ignore
         return bool(torch.cuda.is_available())
@@ -40,15 +41,44 @@ def _detect_default_ocr_gpu() -> bool:
         return False
 
 
+def _detect_default_yolo_half(device: str) -> bool:
+    """FP16: auto-on for CUDA, off for CPU/MPS."""
+    explicit = (os.environ.get("YOLO_HALF") or "").strip().lower()
+    if explicit in ("1", "true", "yes", "on"):
+        return True
+    if explicit in ("0", "false", "no", "off"):
+        return False
+    return device.startswith("cuda")
+
+
 _DEFAULT_YOLO_DEVICE = _detect_default_yolo_device()
 _DEFAULT_OCR_GPU = _detect_default_ocr_gpu()
+_DEFAULT_YOLO_HALF = _detect_default_yolo_half(_DEFAULT_YOLO_DEVICE)
 
-# Pre-set env so any module that reads YOLO_DEVICE (singletons in this codebase)
-# picks up the auto-detected GPU even when the user didn't set it explicitly.
-os.environ.setdefault("YOLO_DEVICE", _DEFAULT_YOLO_DEVICE)
+# Normalise sentinel values so all downstream code (singletons that read
+# os.environ directly) sees concrete values, never "auto".
+os.environ["YOLO_DEVICE"] = _DEFAULT_YOLO_DEVICE
+os.environ["YOLO_HALF"] = "1" if _DEFAULT_YOLO_HALF else "0"
+os.environ["OCR_GPU"] = "1" if _DEFAULT_OCR_GPU else "0"
+
+# Push GPU harder when we actually have a GPU. The T1000 (4 GB, 768 CUDA
+# cores) saturates nicely at 960×960 and still hits 40-50 fps. Bump to
+# 1280 with `YOLO_IMGSZ=1280` for max recall on distant plates.
 if _DEFAULT_YOLO_DEVICE.startswith("cuda"):
-    # T1000 supports FP16 — halve memory + ~2× faster inference.
-    os.environ.setdefault("YOLO_HALF", "1")
+    os.environ.setdefault("YOLO_IMGSZ", "960")
+    # cuDNN autotune picks the fastest convolution algorithm for the input
+    # size on first call — ~10-15% faster YOLO from frame 2 onwards.
+    try:
+        import torch  # type: ignore
+        torch.backends.cudnn.benchmark = True
+        if hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = True
+        if hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = True
+    except Exception:
+        pass
+else:
+    os.environ.setdefault("YOLO_IMGSZ", "640")
 
 
 class VisionSettings(BaseSettings):
@@ -85,10 +115,12 @@ class VisionSettings(BaseSettings):
     """EasyOCR / RapidOCR GPU. Auto-enabled when CUDA is available (e.g. T1000)."""
     YOLO_DEVICE: str = _DEFAULT_YOLO_DEVICE
     """YOLO inference device. Auto: cuda:0 if CUDA detected, else cpu. Override with YOLO_DEVICE env."""
-    YOLO_HALF: bool = _DEFAULT_YOLO_DEVICE.startswith("cuda")
+    YOLO_HALF: bool = _DEFAULT_YOLO_HALF
     """FP16 inference for YOLO on CUDA — halves VRAM, ~2× faster on T1000+. Auto-on for CUDA."""
-    YOLO_IMGSZ: int = 640
-    """Image size for plate-detector YOLO. 640 = best speed/accuracy on T1000."""
+    YOLO_IMGSZ: int = 960
+    """Image size for YOLO inference. 640 = fastest on CPU; 960 = T1000 sweet
+    spot (best accuracy/throughput); 1280 = maximum recall on distant plates
+    at the cost of ~2× compute. Auto-set to 960 when CUDA is detected."""
     PLATE_DETECTION_MODE: str = "opencv_roi"
     """Used when VISION_STACK=rapid: opencv_roi | fullframe."""
     PLATE_FILTER: str = "indian"

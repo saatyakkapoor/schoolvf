@@ -74,6 +74,32 @@ class UltraAccuratePlateDetector:
             try:
                 self.plate_yolo = YOLO(str(primary))
                 self.plate_yolo.fuse()
+                # Move to GPU + FP16 + warm up. Without this the FIRST plate
+                # detection on a real frame pays a 1-2 second CUDA init cost
+                # which is what makes the user wait "8-10 s after the bus
+                # comes" the very first time.
+                try:
+                    device = (os.environ.get("YOLO_DEVICE") or "cpu").strip()
+                    half = os.environ.get("YOLO_HALF", "0").lower() in ("1", "true", "yes")
+                    try:
+                        imgsz = int(os.environ.get("YOLO_IMGSZ", "0") or "0")
+                    except ValueError:
+                        imgsz = 0
+                    if device.startswith("cuda"):
+                        self.plate_yolo.to(device)
+                        if half:
+                            self.plate_yolo.model.half()
+                        warm = np.zeros((imgsz or 640, imgsz or 640, 3), dtype=np.uint8)
+                        self.plate_yolo(
+                            warm, conf=0.5, device=device, half=half,
+                            imgsz=imgsz or 640, verbose=False,
+                        )
+                        log.info(
+                            "Plate YOLO warmed up on %s (half=%s imgsz=%s)",
+                            device, half, imgsz or 640,
+                        )
+                except Exception as warm_exc:
+                    log.debug("Plate YOLO warmup skipped: %s", warm_exc)
                 log.info("Loaded plate YOLO model %s", primary.name)
             except Exception as e:
                 log.warning("Plate YOLO failed: %s", e)
@@ -648,7 +674,16 @@ def read_plates_sample_stack(
 
                 # Method A: plate-trained YOLO inside the bumper crop only.
                 if plate_yolo is not None:
-                    upscale = max(1.0, 640.0 / max(vw, 1))
+                    # Match upscale target to YOLO_IMGSZ so we feed the
+                    # detector real pixels at its working resolution. For
+                    # a tiny 200-px bumper this means 4.8× upscale to 960
+                    # — small plates that used to be 12 px tall become
+                    # 60 px tall, which YOLO can actually find.
+                    try:
+                        _imgsz_target = int(os.environ.get("YOLO_IMGSZ", "640") or "640")
+                    except ValueError:
+                        _imgsz_target = 640
+                    upscale = max(1.0, float(_imgsz_target) / max(vw, 1))
                     if upscale > 1.0:
                         detect_frame = cv2.resize(
                             bumper_crop,
@@ -660,10 +695,21 @@ def read_plates_sample_stack(
 
                     try:
                         device = (os.environ.get("YOLO_DEVICE") or "cpu").strip()
-                        plate_results = plate_yolo(
-                            detect_frame, conf=0.15, iou=0.4,
-                            device=device, verbose=False,
+                        half = os.environ.get("YOLO_HALF", "0").lower() in ("1", "true", "yes")
+                        try:
+                            imgsz = int(os.environ.get("YOLO_IMGSZ", "0") or "0")
+                        except ValueError:
+                            imgsz = 0
+                        yolo_kwargs = dict(
+                            conf=0.10,  # lowered: catches blurry / distant plates
+                            iou=0.4,
+                            device=device,
+                            half=half,
+                            verbose=False,
                         )
+                        if imgsz >= 320:
+                            yolo_kwargs["imgsz"] = imgsz
+                        plate_results = plate_yolo(detect_frame, **yolo_kwargs)
                         if plate_results and hasattr(plate_results[0], "boxes") and plate_results[0].boxes is not None:
                             # Sort plate boxes by confidence descending so we
                             # spend OCR budget on the best ones first.

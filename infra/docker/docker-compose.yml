@@ -131,13 +131,26 @@ services:
       CAMERA_RTSP_URL: ${CAMERA_RTSP_URL:-rtsp://admin:abcd%401234@192.168.1.12:554/Streaming/Channels/101}
       PLATE_ENGINE: ${PLATE_ENGINE:-live}
       PLATE_FILTER: ${PLATE_FILTER:-indian}
-      VISION_STACK: ${VISION_STACK:-rapid}
+      # 'sample' = vehicle YOLO + plate YOLO + EasyOCR, with bumper-zoned
+      # cropping, 2-line plate extension and bus-body-text blacklist. This
+      # is the only stack that handles stacked plates (HR55B / BC2973)
+      # correctly; 'rapid' is kept as a CPU-only fallback.
+      VISION_STACK: ${VISION_STACK:-sample}
       PLATE_STAGE: ${PLATE_STAGE:-recognition}
       PLATE_DETECT_MIN_QUALITY_FOR_OCR: ${PLATE_DETECT_MIN_QUALITY_FOR_OCR:-0.05}
       PLATE_USE_HEURISTIC_BANDS: ${PLATE_USE_HEURISTIC_BANDS:-false}
-      SAMPLE_EASY_OCR_FULLFRAME_FALLBACK: ${SAMPLE_EASY_OCR_FULLFRAME_FALLBACK:-true}
+      # Full-frame OCR fallback intentionally disabled — it's the source of
+      # painted-text misreads (SCHOOL / ARAVALI / DUTY).
+      SAMPLE_EASY_OCR_FULLFRAME_FALLBACK: ${SAMPLE_EASY_OCR_FULLFRAME_FALLBACK:-false}
       MIN_CONFIDENCE: ${MIN_CONFIDENCE:-0.10}
-      OCR_GPU: ${OCR_GPU:-false}
+      # GPU — let the worker auto-detect by default (CUDA → on, else off).
+      # Override with OCR_GPU=true|false in .env.
+      OCR_GPU: ${OCR_GPU:-auto}
+      YOLO_DEVICE: ${YOLO_DEVICE:-auto}
+      YOLO_HALF: ${YOLO_HALF:-auto}
+      # 960 = T1000 sweet spot; bump to 1280 for max recall on distant
+      # plates (~2× GPU work, still real-time on T1000).
+      YOLO_IMGSZ: ${YOLO_IMGSZ:-960}
       # Restrict ingest to these state codes; '*' keeps all 36 Indian states.
       # Recognition still corrects HR↔HE / DL↔OL etc. — the filter only
       # decides whether the corrected plate is forwarded to the API.
