@@ -22,6 +22,7 @@ import numpy as np
 from packages.shared.domain.plate import (
     is_state_allowed,
     is_valid_plate_format,
+    looks_like_bus_body_text,
     normalize_plate_text,
     validate_and_correct_indian,
 )
@@ -488,9 +489,22 @@ def read_plates_sample_stack(
     q_ocr_min = float(s.PLATE_DETECT_MIN_QUALITY_FOR_OCR)
 
     det = get_detector()
-    dets = det.detect_plates_ultra_accurate(frame)
+
+    # Full-frame plate detection is only needed for the supplement path
+    # (when the vehicle-gated path finds nothing) and for PLATE_STAGE=detection.
+    # Otherwise we'd waste 50-150 ms on a redundant YOLO call.
+    dets: list[dict] = []
+    _dets_computed = False
+
+    def _ensure_dets() -> list[dict]:
+        nonlocal _dets_computed, dets
+        if not _dets_computed:
+            dets = det.detect_plates_ultra_accurate(frame)
+            _dets_computed = True
+        return dets
 
     if stage == "detection":
+        dets = _ensure_dets()
         now = time.time()
         if now - _last_detection_log_ts >= 3.0:
             _last_detection_log_ts = now
@@ -518,6 +532,12 @@ def read_plates_sample_stack(
     _rejected_reads: list[str] = []  # diagnostic: collect rejected texts
 
     def _push(norm_key: str, ocr_conf: float, quality: float, *, source: str = "roi") -> None:
+        # First gate: body-paint blacklist. Fastest early-exit and stops
+        # 'SCHUOL' / 'ARAVALI' / 'ONDUTY' from ever reaching the validator.
+        if looks_like_bus_body_text(norm_key):
+            _rejected_reads.append(f"{source}:{norm_key}(bus_body)")
+            log.info("plate REJECT %s '%s' — bus body text", source, norm_key)
+            return
         if not is_valid_plate_format(norm_key):
             _rejected_reads.append(f"{source}:{norm_key}(invalid_fmt)")
             log.info("plate REJECT %s '%s' — not alphanumeric 4-12", source, norm_key)
@@ -546,11 +566,39 @@ def read_plates_sample_stack(
         log.info("plate ACCEPT %s '%s' ocr_conf=%.2f q=%.2f → %.2f",
                  source, norm_key, ocr_conf, quality, combined)
 
-    # ── PRIMARY: two-stage detection (vehicle → plate → enhance → OCR) ────
-    # Stage 1: KITTI model detects vehicles (bus/car/truck)
-    # Stage 2: license_plate_detector.pt finds the PLATE within the vehicle crop
-    # Stage 3: CLAHE + sharpen on just the plate
-    # Stage 4: EasyOCR on the isolated, enhanced plate
+    # ── Per-frame OCR budget ──────────────────────────────────────────────
+    # Hard cap on the number of EasyOCR calls per frame so a vehicle that
+    # produces 10 candidate ROIs can never push cycle time past ~1 second.
+    # The values are deliberate: EasyOCR ≈ 80-200 ms per call on the T1000,
+    # so 4 calls = ~600 ms worst case, leaving headroom for YOLO + I/O.
+    OCR_BUDGET = 4
+    ocr_calls = 0
+
+    def _ocr_with_budget(roi_img, *, ocr_min: float) -> tuple[str | None, float]:
+        nonlocal ocr_calls
+        if ocr_calls >= OCR_BUDGET:
+            return None, 0.0
+        ocr_calls += 1
+        return _easyocr_read_roi(roi_img, reader, ocr_min=ocr_min)
+
+    def _ocr_and_push(roi_img, *, source: str, quality: float, ocr_min: float = 0.10) -> bool:
+        """Run OCR on a single ROI and push the read. Returns True on success."""
+        text, ocr_conf = _ocr_with_budget(roi_img, ocr_min=ocr_min)
+        if not text:
+            return False
+        norm = normalize_plate_text(text)
+        if len(norm) < 4:
+            return False
+        before = len(merged)
+        _push(norm, ocr_conf, quality, source=source)
+        return len(merged) > before
+
+    # ── PRIMARY: vehicle YOLO → plate YOLO inside the bus' BOTTOM 50% ─────
+    # Plates on Indian school buses live on the front/rear bumper, never on
+    # the sides or upper body. By cropping to the bottom 50% of the vehicle
+    # bbox before the plate detector runs we (a) make the YOLO call faster
+    # (smaller input) and (b) make it physically impossible for body-paint
+    # text like "ON SCHOOL DUTY" or "ARAVALI" to be misread as a plate.
     try:
         from apps.vision_worker.app.plate_detection import get_vehicle_detector
 
@@ -560,40 +608,49 @@ def read_plates_sample_stack(
             fh, fw = frame.shape[:2]
             vehicles.sort(key=lambda v: v["confidence"], reverse=True)
 
-            # Get the plate YOLO model from the already-loaded detector
             plate_yolo = det.plate_yolo  # license_plate_detector.pt
 
-            for veh in vehicles[:6]:
+            # Cap to 3 vehicles per frame — beyond that we're spending time
+            # on background traffic that almost certainly isn't the school bus.
+            for veh in vehicles[:3]:
+                if ocr_calls >= OCR_BUDGET or merged:
+                    # Either we've already found a plate or the budget is
+                    # spent — stop scanning more vehicles this frame.
+                    break
                 x1, y1, x2, y2 = veh["bbox"]
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(fw, x2), min(fh, y2)
                 if x2 - x1 < 30 or y2 - y1 < 20:
                     continue
-                vehicle_crop = frame[y1:y2, x1:x2]
-                if vehicle_crop.size == 0:
-                    continue
 
-                vw, vh = vehicle_crop.shape[1], vehicle_crop.shape[0]
+                # ★ Restrict to the BOTTOM 50% of the vehicle — that's the
+                # bumper. Keeps body-paint text out of OCR completely.
+                vh_total = y2 - y1
+                bumper_top = y1 + int(vh_total * 0.45)
+                bumper_crop = frame[bumper_top:y2, x1:x2]
+                if bumper_crop.size == 0:
+                    continue
+                vw, vh = bumper_crop.shape[1], bumper_crop.shape[0]
                 log.info(
-                    "vehicle %s (%d,%d,%d,%d) conf=%.2f crop=%dx%d",
+                    "vehicle %s (%d,%d,%d,%d) conf=%.2f bumper=%dx%d",
                     veh["class_name"], x1, y1, x2, y2, veh["confidence"], vw, vh,
                 )
 
-                # ── Stage 2: find plate WITHIN the vehicle crop ──────────
+                from apps.vision_worker.app.plate_engine import _enhance_vehicle_crop
+
                 plate_rois_found = False
 
-                # Method A: YOLO plate detector on the vehicle crop
+                # Method A: plate-trained YOLO inside the bumper crop only.
                 if plate_yolo is not None:
-                    # Upscale vehicle crop so plate detector has more pixels
                     upscale = max(1.0, 640.0 / max(vw, 1))
                     if upscale > 1.0:
                         detect_frame = cv2.resize(
-                            vehicle_crop,
+                            bumper_crop,
                             (int(vw * upscale), int(vh * upscale)),
                             interpolation=cv2.INTER_LANCZOS4,
                         )
                     else:
-                        detect_frame = vehicle_crop
+                        detect_frame = bumper_crop
 
                     try:
                         device = (os.environ.get("YOLO_DEVICE") or "cpu").strip()
@@ -602,149 +659,134 @@ def read_plates_sample_stack(
                             device=device, verbose=False,
                         )
                         if plate_results and hasattr(plate_results[0], "boxes") and plate_results[0].boxes is not None:
-                            for pbox in plate_results[0].boxes:
+                            # Sort plate boxes by confidence descending so we
+                            # spend OCR budget on the best ones first.
+                            sorted_boxes = sorted(
+                                plate_results[0].boxes,
+                                key=lambda b: float(b.conf[0].cpu().numpy()),
+                                reverse=True,
+                            )
+                            for pbox in sorted_boxes:
+                                if ocr_calls >= OCR_BUDGET:
+                                    break
                                 px1, py1, px2, py2 = (int(v) for v in pbox.xyxy[0].cpu().numpy())
                                 pconf = float(pbox.conf[0].cpu().numpy())
-
-                                # Map back to original vehicle crop coords if upscaled
                                 if upscale > 1.0:
                                     px1 = int(px1 / upscale)
                                     py1 = int(py1 / upscale)
                                     px2 = int(px2 / upscale)
                                     py2 = int(py2 / upscale)
-
-                                # Clamp
                                 px1, py1 = max(0, px1), max(0, py1)
                                 px2, py2 = min(vw, px2), min(vh, py2)
 
-                                plate_roi = vehicle_crop[py1:py2, px1:px2]
-                                if plate_roi.size == 0 or plate_roi.shape[1] < 10:
+                                ph = py2 - py1
+                                pw = px2 - px1
+                                if pw < 10 or ph < 6:
                                     continue
+                                # ★ Two-line plate extension: pad the box
+                                # downward by one full plate height so a
+                                # stacked plate's second line is captured.
+                                py2_ext = min(vh, py2 + ph)
+                                # And give a bit of side padding for chars
+                                # at the rim of the YOLO box.
+                                px1_pad = max(0, px1 - max(4, pw // 20))
+                                px2_pad = min(vw, px2 + max(4, pw // 20))
 
                                 plate_rois_found = True
                                 log.info(
-                                    "  → plate YOLO: (%d,%d,%d,%d) conf=%.2f size=%dx%d",
+                                    "  → plate YOLO box (%d,%d,%d,%d) conf=%.2f → ext to (%d,%d,%d,%d)",
                                     px1, py1, px2, py2, pconf,
-                                    plate_roi.shape[1], plate_roi.shape[0],
+                                    px1_pad, py1, px2_pad, py2_ext,
                                 )
 
-                                # Stage 3: enhance JUST the plate
-                                from apps.vision_worker.app.plate_engine import _enhance_vehicle_crop
-                                plate_enh = _enhance_vehicle_crop(plate_roi, target_min_width=300)
-
-                                # Stage 4: OCR the isolated plate
-                                text, ocr_conf = _easyocr_read_roi(plate_enh, reader, ocr_min=0.10)
-                                log.info("    → EasyOCR plate: text=%r conf=%.3f", text, ocr_conf)
-                                if text:
-                                    norm = normalize_plate_text(text)
-                                    if len(norm) >= 4:
-                                        _push(norm, ocr_conf, max(0.5, pconf), source="veh_plate")
+                                # Tight crop first (single-line plates).
+                                tight = bumper_crop[py1:py2, px1_pad:px2_pad]
+                                if tight.size > 0:
+                                    plate_enh = _enhance_vehicle_crop(tight, target_min_width=300)
+                                    _ocr_and_push(
+                                        plate_enh,
+                                        source="veh_plate",
+                                        quality=max(0.5, pconf),
+                                        ocr_min=0.10,
+                                    )
+                                # If tight didn't give us anything and the
+                                # box could plausibly be a 2-line plate
+                                # (height < 0.6 × width), try the extended
+                                # crop. Costs 1 extra OCR call only when
+                                # the first didn't yield a valid plate.
+                                if not merged and ocr_calls < OCR_BUDGET and ph < pw * 0.6:
+                                    ext = bumper_crop[py1:py2_ext, px1_pad:px2_pad]
+                                    if ext.size > 0:
+                                        ext_enh = _enhance_vehicle_crop(ext, target_min_width=300)
+                                        _ocr_and_push(
+                                            ext_enh,
+                                            source="veh_plate_2line",
+                                            quality=max(0.45, pconf * 0.9),
+                                            ocr_min=0.10,
+                                        )
                     except Exception as e:
-                        log.warning("  → plate YOLO on vehicle crop failed: %s", e)
+                        log.warning("  → plate YOLO on bumper crop failed: %s", e)
 
-                # Method B: OpenCV plate detection on the vehicle crop (fallback)
-                if not plate_rois_found:
-                    from apps.vision_worker.app.plate_detection import collect_plate_region_candidates
-                    cv_plates = list(collect_plate_region_candidates(
-                        vehicle_crop, max_candidates=8, use_heuristic_bands=False,
-                    ))
-                    if cv_plates:
-                        log.info("  → OpenCV found %d plate regions in vehicle crop", len(cv_plates))
-                    for cp in cv_plates[:4]:
-                        roi = cp.get("roi")
-                        if roi is None or roi.size == 0:
-                            continue
-                        plate_rois_found = True
-                        from apps.vision_worker.app.plate_engine import _enhance_vehicle_crop
-                        plate_enh = _enhance_vehicle_crop(roi, target_min_width=300)
-                        text, ocr_conf = _easyocr_read_roi(plate_enh, reader, ocr_min=0.10)
-                        log.info("    → EasyOCR cv-plate: text=%r conf=%.3f", text, ocr_conf)
-                        if text:
-                            norm = normalize_plate_text(text)
-                            if len(norm) >= 4:
-                                _push(norm, ocr_conf, float(cp.get("quality_score", 0.4)), source="veh_cv")
-
-                # Method C: if no plate regions found, try lower-third of vehicle
-                # (plates on Indian buses are typically at bumper level)
-                if not plate_rois_found:
-                    lower_third = vehicle_crop[int(vh * 0.6):, :]
-                    if lower_third.size > 0:
-                        from apps.vision_worker.app.plate_engine import _enhance_vehicle_crop
-                        lower_enh = _enhance_vehicle_crop(lower_third, target_min_width=480)
-                        text, ocr_conf = _easyocr_read_roi(lower_enh, reader, ocr_min=0.10)
-                        log.info("  → EasyOCR lower-third fallback: text=%r conf=%.3f", text, ocr_conf)
-                        if text:
-                            norm = normalize_plate_text(text)
-                            if len(norm) >= 4:
-                                _push(norm, ocr_conf, 0.40, source="veh_lower")
+                # Method B (only if plate-YOLO found nothing AND budget allows):
+                # one OCR call on the whole enhanced bumper crop. Body-text is
+                # already excluded by the bumper crop, so this is safe.
+                if not plate_rois_found and not merged and ocr_calls < OCR_BUDGET:
+                    bumper_enh = _enhance_vehicle_crop(bumper_crop, target_min_width=480)
+                    _ocr_and_push(
+                        bumper_enh,
+                        source="veh_bumper",
+                        quality=0.40,
+                        ocr_min=0.10,
+                    )
 
             if merged:
-                log.info("vehicle-gated TWO-STAGE FOUND: %s", list(merged.keys()))
+                log.info("vehicle-gated FOUND: %s (ocr_calls=%d)", list(merged.keys()), ocr_calls)
             else:
-                log.warning("vehicle-gated: %d vehicles, plate detector + OCR read ZERO plates", len(vehicles))
+                log.info("vehicle-gated: %d vehicles scanned, no plates (ocr_calls=%d)",
+                         len(vehicles), ocr_calls)
         else:
-            log.info("vehicle-gated: no vehicles detected in this frame")
+            log.debug("vehicle-gated: no vehicles detected in this frame")
     except Exception as e:
         log.warning("vehicle-gated FAILED: %s", e, exc_info=True)
 
-    # ── SUPPLEMENT: existing plate-region scan ────────────────────────────
-    # Runs regardless — supplements vehicle-gated results with direct plate ROI reads.
-    for d in dets:
-        if float(d.get("quality_score") or 0) < q_ocr_min:
-            continue
-        method = str(d.get("method", ""))
-        if method.startswith("heuristic_") and float(d.get("quality_score") or 0) < 0.42:
-            continue
-        roi = d.get("roi")
-        if roi is None:
-            continue
-        text, ocr_conf = _easyocr_read_roi(roi, reader, ocr_min=ocr_floor)
-        if not text:
-            continue
-        norm = normalize_plate_text(text)
-        if len(norm) < 4:
-            continue
-        if ocr_conf < ocr_floor:
-            continue
-        _push(norm, ocr_conf, float(d.get("quality_score", 0.5)), source=method[:12])
+    # ── SUPPLEMENT: tight plate ROIs from the standalone detector ─────────
+    # Only used when no vehicles were detected (e.g. close-up gate camera).
+    # Hard-capped by OCR_BUDGET so it can never blow up cycle time.
+    if not merged and ocr_calls < OCR_BUDGET:
+        for d in _ensure_dets():
+            if ocr_calls >= OCR_BUDGET:
+                break
+            if float(d.get("quality_score") or 0) < q_ocr_min:
+                continue
+            method = str(d.get("method", ""))
+            if method.startswith("heuristic_") and float(d.get("quality_score") or 0) < 0.42:
+                continue
+            roi = d.get("roi")
+            if roi is None:
+                continue
+            _ocr_and_push(
+                roi,
+                source=method[:12] or "supp",
+                quality=float(d.get("quality_score", 0.5)),
+                ocr_min=ocr_floor,
+            )
 
-    # Fullframe fallback — only when ROI pass found nothing (avoids ~5s EasyOCR hit every frame).
-    if not merged and bool(getattr(s, "SAMPLE_EASY_OCR_FULLFRAME_FALLBACK", False)):
-        from apps.vision_worker.app.plate_detection import mask_osd_zones
-
-        h, w = frame.shape[:2]
-        frame_clean = mask_osd_zones(frame)
-        ff_min = max(0.12, ocr_floor - 0.06)
-        # Single 2× upscale — better for distant small plates, one OCR pass only
-        up2 = cv2.resize(frame_clean, (int(w * 2), int(h * 2)), interpolation=cv2.INTER_LANCZOS4)
-        text, ocr_conf = _easyocr_read_roi(up2, reader, ocr_min=ff_min)
-        if text:
-            norm = normalize_plate_text(text)
-            if len(norm) >= 4:
-                _push(norm, ocr_conf, 0.42, source="fullframe")
-
-    if not merged:
-        try:
-            from apps.vision_worker.app.plate_detection import mask_osd_zones
-            from apps.vision_worker.app.plate_engine import rapidocr_try_full_frame
-
-            # Pass OSD-masked frame so RapidOCR never sees the Hikvision timestamp/camera text
-            for plate, sc in rapidocr_try_full_frame(
-                mask_osd_zones(frame),
-                min_confidence=max(0.12, float(min_confidence) * 0.65),
-                strict_indian=strict_indian,
-            ):
-                merged[plate] = max(merged.get(plate, 0.0), sc)
-        except Exception as e:
-            log.debug("RapidOCR full-frame fallback: %s", e)
+    # ★ Full-frame fallbacks (EasyOCR-on-frame and RapidOCR-on-frame) are
+    # intentionally REMOVED. They were the source of every "SCHUOL" /
+    # "ARAVALI" / "ONDUTY" misread because they OCR'd the entire bus body
+    # (paint, signs, school name) as if it were a plate. If the vehicle-
+    # gated path finds no plate, we'd rather post nothing than post body
+    # text. Real plates can be picked up next frame — the grabber thread
+    # ensures we always have a fresh one in <130 ms.
 
     # Log what we read (and rejected) every ~5 seconds so the dashboard debug panel shows something
     now = time.time()
     if now - _last_detection_log_ts >= 5.0:
         _last_detection_log_ts = now
         log.info(
-            "sample_stack: rois=%d merged=%s rejected=%s",
+            "sample_stack: rois=%d ocr_calls=%d merged=%s rejected=%s",
             len(dets),
+            ocr_calls,
             list(merged.keys()) or "none",
             _rejected_reads[:8] or "none",
         )

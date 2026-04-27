@@ -17,6 +17,7 @@ import numpy as np
 from packages.shared.domain.plate import (
     is_state_allowed,
     is_valid_plate_format,
+    looks_like_bus_body_text,
     normalize_plate_text,
     validate_and_correct_indian,
 )
@@ -421,6 +422,9 @@ def _parse_rapid_result(
         norm = normalize_plate_text(text_raw)
         if len(norm) < 4:
             log.info("ocr%s skip '%s' — too short after normalize", debug_label, text_raw)
+            continue
+        if looks_like_bus_body_text(norm):
+            log.info("ocr%s skip '%s' — bus body text", debug_label, norm)
             continue
         if not is_valid_plate_format(norm):
             log.info("ocr%s skip '%s' — not alphanumeric plate format", debug_label, norm)

@@ -184,6 +184,77 @@ def normalize_plate_text(raw: str) -> str:
     return cleaned
 
 
+# ---------------------------------------------------------------------------
+# Non-plate text blacklist — words that frequently appear painted on Indian
+# school-bus bodywork and have absolutely no business being treated as plate
+# reads. The list is matched as substrings against the *normalized* OCR
+# output (so "ON SCHOOL DUTY" → "ONSCHOOLDUTY" and "SCHOOL" both hit).
+# ---------------------------------------------------------------------------
+_NON_PLATE_SUBSTRINGS: tuple[str, ...] = (
+    "SCHOOL",
+    "SCHUOL",   # common OCR misread of SCHOOL
+    "SCHOL",
+    "DUTY",
+    "ONDUTY",
+    "ARAVALI",
+    "ARAVAL",
+    "RAVAL",     # OCR partial of ARAVALI
+    "RAVALI",
+    "TSRS",
+    "BUS",
+    "BSS",      # frequent OCR for BUS at distance
+    "DRIVE",
+    "DRIVER",
+    "STAFF",
+    "STUDENT",
+    "PRIVATE",
+    "EDUCATION",
+    "ACADEMY",
+    "INSTITUTE",
+    "PUBLIC",
+    "EMERGENCY",
+    "POLICE",
+    "FIRE",
+    "AMBULANCE",
+    "ENTRANCE",
+    "EXIT",
+    "STOP",
+    "CHILDREN",
+    "KIDS",
+    "WELCOME",
+    "GATE",
+)
+
+# Allowed 2-letter prefixes that are NEVER a state code on an Indian plate.
+# (Plates can never start with these, but bus-body text can.)
+_NEVER_STATE_PREFIXES: frozenset[str] = frozenset({
+    "SC", "BU", "ED", "AC", "IN", "PR", "EM", "PO", "FI",
+    "AM", "EN", "EX", "ST", "CH", "KI", "WE", "GA", "ON",
+    "DR", "TS", "AR",  # AR is the route prefix, not a state
+})
+
+
+def looks_like_bus_body_text(norm: str) -> bool:
+    """True if `norm` is almost certainly bus body paint, not a plate.
+
+    Three signals, any one is enough:
+      * Contains a known non-plate substring (SCHOOL, ARAVALI, …).
+      * Starts with a 2-letter combo that's never a real state code.
+      * Has no digits at all (real plates always carry a 1-4 digit serial).
+    """
+    if not norm:
+        return True
+    upper = norm.upper()
+    for word in _NON_PLATE_SUBSTRINGS:
+        if word in upper:
+            return True
+    # Real Indian plates always contain digits. Pure-letter strings are
+    # painted text 99% of the time (school name, slogan, etc.).
+    if not any(c.isdigit() for c in upper):
+        return True
+    return False
+
+
 def is_valid_plate_format(norm: str) -> bool:
     """Return True if normalized text matches the loose alphanumeric pattern."""
     return bool(_PLATE_PATTERN.match(norm))

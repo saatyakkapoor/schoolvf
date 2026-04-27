@@ -99,18 +99,10 @@ def _read_route_number(frame: "np.ndarray") -> str | None:
     """
     Route-number reader optimised for yellow AR-XX placards on a moving bus.
 
-    Two complementary passes run and the largest-bbox match wins:
-
-    Pass 1 — Yellow HSV mask  (primary, fastest):
-        Isolate yellow pixels → find largest placard-shaped blob → 3× upscale + sharpen → OCR.
-        Works even when the bus is moving because the placard colour is unique in the scene.
-
-    Pass 2 — Multi-zone crops  (fallback for low-light / non-yellow placards):
-        Three overlapping crops of the bus-front area, each 2× upscaled + sharpened → OCR.
-
-    Both passes use RapidOCR on CPU so they never contend with the GPU plate OCR engine.
-    The function is called from a dedicated thread while GPU plate OCR runs on the main thread,
-    achieving simultaneous CPU + GPU utilisation.
+    Strategy: ONE fast OCR pass on the yellow placard blob. If that misses,
+    we fall back to a SINGLE wide windshield-band crop. The previous
+    multi-zone scan was running 4 OCR passes per frame and adding 1-2 s
+    of latency for every frame that didn't have a clear placard.
     """
     try:
         from apps.vision_worker.app.plate_engine import _get_ocr
@@ -187,36 +179,22 @@ def _read_route_number(frame: "np.ndarray") -> str | None:
                     log.info("route yellow_mask OCR: match=%s texts=%s", r, texts[:10])
 
         # ------------------------------------------------------------------ #
-        # Pass 2: multi-zone crops (fallback / reinforcement)                #
+        # Pass 2: ONE windshield-band crop (only if yellow mask missed)      #
         # ------------------------------------------------------------------ #
-        # Three zones covering where the placard / LED can plausibly appear.
-        # Zones are intentionally overlapping for robustness on different bus types.
-        zones = [
-            # (top_frac, bot_frac, left_frac, right_frac, label)
-            (0.08, 0.50, 0.10, 0.90, "zone_mid"),      # windshield centre
-            (0.04, 0.32, 0.05, 0.95, "zone_upper"),    # LED display strip near roof
-            (0.10, 0.65, 0.00, 1.00, "zone_wide"),     # wide sweep — misaligned cameras
-        ]
-        for top_f, bot_f, left_f, right_f, label in zones:
-            if best_route:
-                break  # yellow mask already gave a confident result — skip remaining zones
-            top  = int(h * top_f)
-            bot  = int(h * bot_f)
-            left = int(w * left_f)
-            right = int(w * right_f)
-            roi = frame[top:bot, left:right].copy()
-            if roi.size == 0:
-                continue
-            # 2× upscale + moderate unsharp mask
-            roi = cv2.resize(roi, (roi.shape[1] * 2, roi.shape[0] * 2),
-                             interpolation=cv2.INTER_LINEAR)
-            roi = _sharpen_roi(roi, strength=1.2)
-            result, _ = ocr(roi)
-            if result:
-                r, a = _ocr_scan_for_route(result, label)
-                if r and a > best_area:
-                    best_area = a
-                    best_route = r
+        if not best_route:
+            top = int(h * 0.10)
+            bot = int(h * 0.55)
+            roi = frame[top:bot, :].copy()
+            if roi.size > 0:
+                roi = cv2.resize(roi, (roi.shape[1] * 2, roi.shape[0] * 2),
+                                 interpolation=cv2.INTER_LINEAR)
+                roi = _sharpen_roi(roi, strength=1.2)
+                result, _ = ocr(roi)
+                if result:
+                    r, a = _ocr_scan_for_route(result, "windshield")
+                    if r and a > best_area:
+                        best_area = a
+                        best_route = r
 
         if best_route:
             log.info("route OCR winner: %s  area=%.0f", best_route, best_area)
