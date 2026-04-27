@@ -569,9 +569,12 @@ def read_plates_sample_stack(
     # ── Per-frame OCR budget ──────────────────────────────────────────────
     # Hard cap on the number of EasyOCR calls per frame so a vehicle that
     # produces 10 candidate ROIs can never push cycle time past ~1 second.
-    # The values are deliberate: EasyOCR ≈ 80-200 ms per call on the T1000,
-    # so 4 calls = ~600 ms worst case, leaving headroom for YOLO + I/O.
-    OCR_BUDGET = 4
+    # EasyOCR ≈ 80-200 ms per call on the T1000, so 6 calls ≈ 800 ms worst
+    # case. We need 6 (not 4) so we can ALWAYS run both the tight and the
+    # downward-extended crop on the highest-confidence plate-YOLO box —
+    # without that, two-line plates like "HR55B / BC2973" report only the
+    # first line ("HR55B" → "HR558" after digit-letter swap).
+    OCR_BUDGET = 6
     ocr_calls = 0
 
     def _ocr_with_budget(roi_img, *, ocr_min: float) -> tuple[str | None, float]:
@@ -592,6 +595,9 @@ def read_plates_sample_stack(
         before = len(merged)
         _push(norm, ocr_conf, quality, source=source)
         return len(merged) > before
+
+    def _best_merged_plate_len() -> int:
+        return max((len(p) for p in merged), default=0)
 
     # ── PRIMARY: vehicle YOLO → plate YOLO inside the bus' BOTTOM 50% ─────
     # Plates on Indian school buses live on the front/rear bumper, never on
@@ -683,24 +689,38 @@ def read_plates_sample_stack(
                                 pw = px2 - px1
                                 if pw < 10 or ph < 6:
                                     continue
-                                # ★ Two-line plate extension: pad the box
-                                # downward by one full plate height so a
-                                # stacked plate's second line is captured.
-                                py2_ext = min(vh, py2 + ph)
-                                # And give a bit of side padding for chars
-                                # at the rim of the YOLO box.
+
+                                # Padding around the YOLO box. Plate
+                                # detectors regularly clip 1-2 chars at
+                                # the edges, especially on the first line
+                                # of a stacked plate, so we always pad.
                                 px1_pad = max(0, px1 - max(4, pw // 20))
                                 px2_pad = min(vw, px2 + max(4, pw // 20))
 
+                                # ★ Two-line plate extension: pad the box
+                                # downward by one full plate height so a
+                                # stacked plate's second line is captured.
+                                # We ALSO pad upward by a little to catch
+                                # the first-line top edge.
+                                py1_pad = max(0, py1 - max(2, ph // 10))
+                                py2_ext = min(vh, py2 + ph)
+
                                 plate_rois_found = True
                                 log.info(
-                                    "  → plate YOLO box (%d,%d,%d,%d) conf=%.2f → ext to (%d,%d,%d,%d)",
-                                    px1, py1, px2, py2, pconf,
-                                    px1_pad, py1, px2_pad, py2_ext,
+                                    "  → plate YOLO box (%d,%d,%d,%d) conf=%.2f ratio=%.2f → tight+2line",
+                                    px1, py1, px2, py2, pconf, (ph / max(pw, 1)),
                                 )
 
-                                # Tight crop first (single-line plates).
-                                tight = bumper_crop[py1:py2, px1_pad:px2_pad]
+                                # Always do BOTH crops:
+                                #   1) the tight (padded) box  → wins on single-line plates
+                                #   2) the downward-extended box → wins on stacked 2-line plates
+                                # We prefer whichever yields the longer valid plate.
+                                # Without this, stacked plates like "HR55B / BC2973"
+                                # report only the first line ("HR558") because the
+                                # YOLO box's tight crop happens to be readable.
+
+                                # Crop 1: tight (single-line plate winner)
+                                tight = bumper_crop[py1_pad:py2, px1_pad:px2_pad]
                                 if tight.size > 0:
                                     plate_enh = _enhance_vehicle_crop(tight, target_min_width=300)
                                     _ocr_and_push(
@@ -709,13 +729,17 @@ def read_plates_sample_stack(
                                         quality=max(0.5, pconf),
                                         ocr_min=0.10,
                                     )
-                                # If tight didn't give us anything and the
-                                # box could plausibly be a 2-line plate
-                                # (height < 0.6 × width), try the extended
-                                # crop. Costs 1 extra OCR call only when
-                                # the first didn't yield a valid plate.
-                                if not merged and ocr_calls < OCR_BUDGET and ph < pw * 0.6:
-                                    ext = bumper_crop[py1:py2_ext, px1_pad:px2_pad]
+
+                                # Crop 2: 2-line extension (always run unless
+                                # we already have a long plate, e.g. ≥9 chars,
+                                # which means the tight crop already captured
+                                # both lines on its own).
+                                if (
+                                    ocr_calls < OCR_BUDGET
+                                    and _best_merged_plate_len() < 9
+                                    and py2_ext > py2
+                                ):
+                                    ext = bumper_crop[py1_pad:py2_ext, px1_pad:px2_pad]
                                     if ext.size > 0:
                                         ext_enh = _enhance_vehicle_crop(ext, target_min_width=300)
                                         _ocr_and_push(
@@ -779,7 +803,36 @@ def read_plates_sample_stack(
     # text. Real plates can be picked up next frame — the grabber thread
     # ensures we always have a fresh one in <130 ms.
 
-    # Log what we read (and rejected) every ~5 seconds so the dashboard debug panel shows something
+    # ── Dedupe partial reads against complete reads ──────────────────────
+    # When a 2-line plate is captured both ways (tight crop yields just the
+    # top line, extended crop yields the full plate), we get two entries:
+    #   "HR558"     (top line, B→8 collapse)   — short, low signal
+    #   "HR55BC2973" (full plate)              — long, high signal
+    # The user shouldn't see two detections for the same bus. We suppress
+    # any plate that is "dominated" by a longer one with the same state +
+    # district prefix.
+    if len(merged) > 1:
+        plates_by_len = sorted(merged.keys(), key=len, reverse=True)
+        suppressed: set[str] = set()
+        for long in plates_by_len:
+            if long in suppressed or len(long) < 7:
+                continue
+            long_prefix = long[:4]  # state(2) + district(≥1-2)
+            for short in plates_by_len:
+                if short == long or short in suppressed:
+                    continue
+                if len(short) >= len(long):
+                    continue
+                # Match on state code + at least the first district digit.
+                if short[:4] == long_prefix or short[:3] == long[:3]:
+                    suppressed.add(short)
+                    log.info(
+                        "plate dedupe: '%s' dominated by '%s' (same state+district)",
+                        short, long,
+                    )
+        for s_drop in suppressed:
+            merged.pop(s_drop, None)
+
     now = time.time()
     if now - _last_detection_log_ts >= 5.0:
         _last_detection_log_ts = now
@@ -791,4 +844,4 @@ def read_plates_sample_stack(
             _rejected_reads[:8] or "none",
         )
 
-    return [(p, merged[p]) for p in sorted(merged)]
+    return [(p, merged[p]) for p in sorted(merged, key=lambda k: (-len(k), -merged[k]))]
