@@ -136,8 +136,12 @@ services:
       PLATE_DETECT_MIN_QUALITY_FOR_OCR: ${PLATE_DETECT_MIN_QUALITY_FOR_OCR:-0.05}
       PLATE_USE_HEURISTIC_BANDS: ${PLATE_USE_HEURISTIC_BANDS:-false}
       SAMPLE_EASY_OCR_FULLFRAME_FALLBACK: ${SAMPLE_EASY_OCR_FULLFRAME_FALLBACK:-true}
-      MIN_CONFIDENCE: ${MIN_CONFIDENCE:-0.16}
+      MIN_CONFIDENCE: ${MIN_CONFIDENCE:-0.10}
       OCR_GPU: ${OCR_GPU:-false}
+      # Restrict ingest to these state codes; '*' keeps all 36 Indian states.
+      # Recognition still corrects HR↔HE / DL↔OL etc. — the filter only
+      # decides whether the corrected plate is forwarded to the API.
+      PLATE_ALLOWED_STATES: ${PLATE_ALLOWED_STATES:-HR,DL,CH,UP}
       PLATE_DETECTION_MODE: ${PLATE_DETECTION_MODE:-opencv_roi}
       # 0 = no artificial delay between frames (limited by OCR/YOLO speed only)
       PROCESS_INTERVAL_SEC: ${PROCESS_INTERVAL_SEC:-0}

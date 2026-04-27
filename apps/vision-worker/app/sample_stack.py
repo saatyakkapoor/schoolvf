@@ -20,6 +20,7 @@ import cv2
 import numpy as np
 
 from packages.shared.domain.plate import (
+    is_state_allowed,
     is_valid_plate_format,
     normalize_plate_text,
     validate_and_correct_indian,
@@ -309,12 +310,18 @@ def get_easyocr_reader(gpu: bool | None = None):
 
 
 def _fast_text_cleaning(text: str) -> str | None:
-    """Strip to A-Z0-9; allow 8+ chars for Indian HSRP-style 10-character plates."""
+    """Strip to A-Z0-9; keep anything 5+ chars so the validator can decide.
+
+    Indian HSRP plates are 8–10 chars, but partial reads like 'HR1234'
+    (6 chars) or 'DL3CAB' (6 chars from a half-read two-line plate) are
+    real plates after correction. Letting them through here means the
+    validator's state-code correction + two-line merge can salvage them.
+    """
     if not text:
         return None
     text = text.upper().strip()
     text = re.sub(r"[^A-Z0-9]", "", text)
-    return text if len(text) >= 8 else (text if len(text) >= 6 else None)
+    return text if len(text) >= 5 else None
 
 
 _OCR_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -502,8 +509,10 @@ def read_plates_sample_stack(
         return []
 
     reader = get_easyocr_reader()
-    # Lower floor so EasyOCR reads in the 0.15–0.25 range (common for real plates) aren't thrown away.
-    ocr_floor = max(float(min_confidence), 0.15)
+    # Lower floor so EasyOCR reads in the 0.10–0.25 range (common for distant/blurry plates)
+    # aren't thrown away. The validator's regex + state correction is strict enough that
+    # we don't need a high confidence floor to keep noise out.
+    ocr_floor = max(float(min_confidence), 0.10)
 
     merged: dict[str, float] = {}
     _rejected_reads: list[str] = []  # diagnostic: collect rejected texts
@@ -511,15 +520,31 @@ def read_plates_sample_stack(
     def _push(norm_key: str, ocr_conf: float, quality: float, *, source: str = "roi") -> None:
         if not is_valid_plate_format(norm_key):
             _rejected_reads.append(f"{source}:{norm_key}(invalid_fmt)")
+            log.info("plate REJECT %s '%s' — not alphanumeric 4-12", source, norm_key)
             return
         if strict_indian:
             corrected = validate_and_correct_indian(norm_key)
             if corrected is None:
                 _rejected_reads.append(f"{source}:{norm_key}(not_indian)")
+                log.info("plate REJECT %s '%s' — failed indian validation", source, norm_key)
                 return
-            norm_key = corrected  # use OCR-corrected plate text
+            if corrected != norm_key:
+                log.info("plate correct %s '%s' → '%s'", source, norm_key, corrected)
+            norm_key = corrected
+            # Deployment allow-list (HR/DL/CH/UP by default) — separate from
+            # recognition. Logged at WARNING so it's obvious in the docker logs
+            # when valid plates are being rejected because of the filter.
+            if not is_state_allowed(norm_key):
+                _rejected_reads.append(f"{source}:{norm_key}(state_filtered)")
+                log.warning(
+                    "plate REJECT %s '%s' — state '%s' not in PLATE_ALLOWED_STATES (set '*' to accept all)",
+                    source, norm_key, norm_key[:2],
+                )
+                return
         combined = min(1.0, 0.5 * quality + 0.5 * ocr_conf)
         merged[norm_key] = max(merged.get(norm_key, 0.0), combined)
+        log.info("plate ACCEPT %s '%s' ocr_conf=%.2f q=%.2f → %.2f",
+                 source, norm_key, ocr_conf, quality, combined)
 
     # ── PRIMARY: two-stage detection (vehicle → plate → enhance → OCR) ────
     # Stage 1: KITTI model detects vehicles (bus/car/truck)

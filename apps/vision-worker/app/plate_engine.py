@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 
 from packages.shared.domain.plate import (
+    is_state_allowed,
     is_valid_plate_format,
     normalize_plate_text,
     validate_and_correct_indian,
@@ -429,9 +430,19 @@ def _parse_rapid_result(
             if corrected is None:
                 log.info("ocr%s REJECT '%s' conf=%.2f — failed indian validation", debug_label, norm, score)
                 continue
+            if corrected != norm:
+                log.info("ocr%s correct '%s' → '%s'", debug_label, norm, corrected)
             norm = corrected
         if score < min_confidence:
             log.info("ocr%s REJECT '%s' conf=%.2f — below threshold %.2f", debug_label, norm, score, min_confidence)
+            continue
+        # Deployment allow-list filter is applied separately so misreads from
+        # non-allowed states are logged loudly (helps diagnose recognition).
+        if strict_indian and not is_state_allowed(norm):
+            log.warning(
+                "ocr%s REJECT '%s' conf=%.2f — state '%s' not in deployment allow-list (set PLATE_ALLOWED_STATES=* to disable)",
+                debug_label, norm, score, norm[:2],
+            )
             continue
         log.info("ocr%s ACCEPT '%s' conf=%.2f", debug_label, norm, score)
         out.append((norm, min(1.0, score)))
