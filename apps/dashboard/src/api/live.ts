@@ -1,4 +1,4 @@
-import type { LiveDebugEntry, LiveDetection } from "../types";
+import type { LiveDebugEntry, LiveDetection, ManualEntryPayload } from "../types";
 
 import apiClient from "./client";
 
@@ -24,4 +24,18 @@ export async function adjustDetection(
     swap_type: payload.swap_type,
     notes: payload.notes ?? null,
   });
+}
+
+export async function submitManualDetection(
+  payload: ManualEntryPayload,
+): Promise<{ status: string; id: string; row: LiveDetection }> {
+  const { data } = await apiClient.post("/live/manual-detection", {
+    plate_text: payload.plate_text || undefined,
+    route_number: payload.route_number || undefined,
+    camera_id: payload.camera_id ?? "manual",
+    camera_name: payload.camera_name ?? "Manual entry",
+    notes: payload.notes ?? null,
+    confidence: payload.confidence ?? 1.0,
+  });
+  return data;
 }

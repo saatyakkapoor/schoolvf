@@ -139,13 +139,15 @@ class VehicleDetector:
         try:
             import os
             device = (os.environ.get("YOLO_DEVICE") or "cpu").strip()
-            results = self._model(
-                frame,
-                conf=conf,
-                iou=0.5,
-                device=device,
-                verbose=False,
-            )
+            half = os.environ.get("YOLO_HALF", "0").lower() in ("1", "true", "yes")
+            try:
+                imgsz = int(os.environ.get("YOLO_IMGSZ", "0") or "0")
+            except ValueError:
+                imgsz = 0
+            yolo_kwargs = dict(conf=conf, iou=0.5, device=device, half=half, verbose=False)
+            if imgsz >= 320:
+                yolo_kwargs["imgsz"] = imgsz
+            results = self._model(frame, **yolo_kwargs)
             detections: list[dict[str, Any]] = []
             if not results or not hasattr(results[0], "boxes") or results[0].boxes is None:
                 log.debug("VehicleDetector: YOLO returned no results")

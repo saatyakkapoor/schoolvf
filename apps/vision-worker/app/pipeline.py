@@ -267,6 +267,20 @@ _http_pool: ThreadPoolExecutor | None = None
 # Reusable httpx client with connection pooling
 _http_client: httpx.Client | None = None
 
+# Persistent OCR pool — running plate OCR (GPU) and route OCR (CPU) in parallel.
+# Created once and reused across every frame to avoid spawning two OS threads
+# per frame at ~30 fps. Max-workers=2 because we always have exactly 2 jobs:
+# plate OCR + route OCR. Per-camera loops share this pool safely; the underlying
+# OCR singletons own their own thread-safety contracts (EasyOCR/RapidOCR).
+_ocr_pool: ThreadPoolExecutor | None = None
+
+
+def _get_ocr_pool() -> ThreadPoolExecutor:
+    global _ocr_pool
+    if _ocr_pool is None:
+        _ocr_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ocr")
+    return _ocr_pool
+
 
 def _http_pool_submit(s: VisionSettings, fn, *args, **kwargs) -> None:
     global _http_pool
@@ -415,6 +429,27 @@ def _camera_cooldown_mark(
     recent[camera_id] = (time.time(), plate)
 
 
+def _route_only_dedupe_allow(
+    route: str,
+    camera_id: str,
+    last: dict[str, float],
+    window: float,
+) -> bool:
+    """
+    Allow posting a route-only sighting (no plate text read) at most once per
+    `window` seconds per (camera, route). Prevents flooding the dashboard
+    when a bus sits in front of the camera and the placard reads cleanly
+    every frame but the plate is too blurry to OCR.
+    """
+    key = f"route-only::{camera_id}::{route}"
+    now = time.time()
+    prev = last.get(key)
+    if prev is not None and now - prev < window:
+        return False
+    last[key] = now
+    return True
+
+
 def _post_live_debug_sync(
     api_base: str,
     secret: str,
@@ -492,22 +527,23 @@ def _announce_worker_online(s: VisionSettings) -> None:
 def _post_detection_sync(
     api_base: str,
     secret: str,
-    plate: str,
+    plate: str | None,
     confidence: float,
     camera_id: str,
     camera_name: str,
     snapshot_b64: str | None,
     detected_route: str | None = None,
 ) -> None:
-    """Actual HTTP POST — runs in thread pool."""
+    """Actual HTTP POST — runs in thread pool. plate may be None for route-only sightings."""
     url = f"{api_base}/api/live/detections"
     body: dict[str, Any] = {
-        "plate_text": plate,
         "confidence": confidence,
         "camera_id": camera_id,
         "camera_name": camera_name,
         "snapshot_base64": snapshot_b64,
     }
+    if plate:
+        body["plate_text"] = plate
     if detected_route:
         body["detected_route"] = detected_route
     try:
@@ -523,7 +559,7 @@ def _post_detection_sync(
 
 def _post_detection(
     s: VisionSettings,
-    plate: str,
+    plate: str | None,
     confidence: float,
     snapshot_b64: str | None,
     *,
@@ -636,26 +672,25 @@ def run_rtsp_loop(
                 # ── Simultaneous CPU + GPU OCR ────────────────────────────────
                 # Plate OCR  → GPU (EasyOCR/YOLO when OCR_GPU=True, else CPU)
                 # Route OCR  → CPU (RapidOCR ONNX), always runs in a worker thread
-                # Both start at the same time; we wait for both to finish.
+                # Both submitted to the persistent OCR pool — no per-frame thread spawning.
                 frame_copy = frame.copy()
                 t_ocr = time.time()
-                with ThreadPoolExecutor(max_workers=2,
-                                            thread_name_prefix="ocr") as _pool:
-                    _plate_fut = _pool.submit(
-                        read_plates_from_frame,
-                        frame,
-                        min_confidence=s.MIN_CONFIDENCE,
-                        strict_indian=strict_indian,
-                        detection_mode=s.PLATE_DETECTION_MODE.strip().lower(),
-                        vision_stack=s.VISION_STACK,
-                    )
-                    _route_fut = _pool.submit(_read_route_number, frame_copy)
-                    plates = _plate_fut.result()
-                    route: str | None = None
-                    try:
-                        route = _route_fut.result(timeout=10)
-                    except Exception as _re:
-                        log.debug("route OCR timeout/error: %s", _re)
+                _pool = _get_ocr_pool()
+                _plate_fut = _pool.submit(
+                    read_plates_from_frame,
+                    frame,
+                    min_confidence=s.MIN_CONFIDENCE,
+                    strict_indian=strict_indian,
+                    detection_mode=s.PLATE_DETECTION_MODE.strip().lower(),
+                    vision_stack=s.VISION_STACK,
+                )
+                _route_fut = _pool.submit(_read_route_number, frame_copy)
+                plates = _plate_fut.result()
+                route: str | None = None
+                try:
+                    route = _route_fut.result(timeout=10)
+                except Exception as _re:
+                    log.debug("route OCR timeout/error: %s", _re)
                 ocr_ms = int((time.time() - t_ocr) * 1000)
                 # ─────────────────────────────────────────────────────────────
 
@@ -695,7 +730,6 @@ def run_rtsp_loop(
 
                 snap: str | None = None
                 posted_any = False
-                posted_any = False
                 for plate, conf in plates:
                     if not _dedupe_allow(plate, last, s.DEDUPE_SECONDS, route):
                         log.debug("plate dedupe skip: %s", plate)
@@ -710,6 +744,20 @@ def run_rtsp_loop(
                     )
                     _camera_cooldown_mark(plate, cid, recent_cam)
                     posted_any = True
+
+                # Route-only fallback: bus visible (placard readable) but plate
+                # OCR returned nothing. Post a route-only sighting so the API
+                # can fill the plate from the registry — dashboard renders a
+                # yellow triangle to flag the auto-fill.
+                if not posted_any and route:
+                    if _route_only_dedupe_allow(route, cid, last, max(s.DEDUPE_SECONDS, 6.0)):
+                        if snap is None:
+                            snap = frame_to_jpeg_b64(frame, s.SNAPSHOT_MAX_WIDTH)
+                        _post_detection(
+                            s, None, 0.0, snap or None,
+                            camera_id=cid, camera_name=cname, detected_route=route,
+                        )
+                        log.info("route-only post: route=%s camera=%s (no plate this frame)", route, cid)
                 if s.PROCESS_INTERVAL_SEC > 0:
                     time.sleep(s.PROCESS_INTERVAL_SEC)
         finally:
@@ -770,26 +818,25 @@ def run_webcam_loop(
                     log.info("camera %s webcam alive — frame #%d", cid, frame_n)
                 strict_indian = s.PLATE_FILTER.strip().lower() == "indian"
 
-                # ── Simultaneous CPU + GPU OCR ────────────────────────────────
+                # ── Simultaneous CPU + GPU OCR (persistent pool) ─────────────
                 frame_copy = frame.copy()
                 t_ocr = time.time()
-                with ThreadPoolExecutor(max_workers=2,
-                                            thread_name_prefix="ocr") as _pool:
-                    _plate_fut = _pool.submit(
-                        read_plates_from_frame,
-                        frame,
-                        min_confidence=s.MIN_CONFIDENCE,
-                        strict_indian=strict_indian,
-                        detection_mode=s.PLATE_DETECTION_MODE.strip().lower(),
-                        vision_stack=s.VISION_STACK,
-                    )
-                    _route_fut = _pool.submit(_read_route_number, frame_copy)
-                    plates = _plate_fut.result()
-                    route: str | None = None
-                    try:
-                        route = _route_fut.result(timeout=10)
-                    except Exception as _re:
-                        log.debug("route OCR timeout/error: %s", _re)
+                _pool = _get_ocr_pool()
+                _plate_fut = _pool.submit(
+                    read_plates_from_frame,
+                    frame,
+                    min_confidence=s.MIN_CONFIDENCE,
+                    strict_indian=strict_indian,
+                    detection_mode=s.PLATE_DETECTION_MODE.strip().lower(),
+                    vision_stack=s.VISION_STACK,
+                )
+                _route_fut = _pool.submit(_read_route_number, frame_copy)
+                plates = _plate_fut.result()
+                route: str | None = None
+                try:
+                    route = _route_fut.result(timeout=10)
+                except Exception as _re:
+                    log.debug("route OCR timeout/error: %s", _re)
                 ocr_ms = int((time.time() - t_ocr) * 1000)
                 # ─────────────────────────────────────────────────────────────
 
@@ -817,6 +864,7 @@ def run_webcam_loop(
                         },
                     )
                 snap: str | None = None
+                posted_any = False
                 for plate, conf in plates:
                     if not _dedupe_allow(plate, last, s.DEDUPE_SECONDS, route):
                         continue
@@ -827,6 +875,18 @@ def run_webcam_loop(
                         snap = frame_to_jpeg_b64(frame, s.SNAPSHOT_MAX_WIDTH)
                     _post_detection(s, plate, conf, snap or None, camera_id=cid, camera_name=cname,
                                     detected_route=route)
+                    posted_any = True
+
+                # Route-only fallback (webcam path) — see RTSP loop for the rationale.
+                if not posted_any and route:
+                    if _route_only_dedupe_allow(route, cid, last, max(s.DEDUPE_SECONDS, 6.0)):
+                        if snap is None:
+                            snap = frame_to_jpeg_b64(frame, s.SNAPSHOT_MAX_WIDTH)
+                        _post_detection(
+                            s, None, 0.0, snap or None,
+                            camera_id=cid, camera_name=cname, detected_route=route,
+                        )
+                        log.info("route-only post (webcam): route=%s camera=%s", route, cid)
                 if s.PROCESS_INTERVAL_SEC > 0:
                     time.sleep(s.PROCESS_INTERVAL_SEC)
         finally:

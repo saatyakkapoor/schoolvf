@@ -1,8 +1,54 @@
 """Vision worker configuration."""
 
+import os
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings
+
+
+def _detect_default_yolo_device() -> str:
+    """
+    Pick the best available compute device automatically.
+    Honours YOLO_DEVICE env var if set (e.g. cuda:0, cpu, mps).
+    Falls back to CUDA when torch reports a working GPU; else CPU.
+    """
+    explicit = (os.environ.get("YOLO_DEVICE") or "").strip()
+    if explicit:
+        return explicit
+    try:
+        import torch  # type: ignore
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            return "cuda:0"
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def _detect_default_ocr_gpu() -> bool:
+    """EasyOCR / RapidOCR GPU defaults to ON when CUDA is reachable."""
+    explicit = (os.environ.get("OCR_GPU") or "").strip().lower()
+    if explicit in ("1", "true", "yes", "on"):
+        return True
+    if explicit in ("0", "false", "no", "off"):
+        return False
+    try:
+        import torch  # type: ignore
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+_DEFAULT_YOLO_DEVICE = _detect_default_yolo_device()
+_DEFAULT_OCR_GPU = _detect_default_ocr_gpu()
+
+# Pre-set env so any module that reads YOLO_DEVICE (singletons in this codebase)
+# picks up the auto-detected GPU even when the user didn't set it explicitly.
+os.environ.setdefault("YOLO_DEVICE", _DEFAULT_YOLO_DEVICE)
+if _DEFAULT_YOLO_DEVICE.startswith("cuda"):
+    # T1000 supports FP16 — halve memory + ~2× faster inference.
+    os.environ.setdefault("YOLO_HALF", "1")
 
 
 class VisionSettings(BaseSettings):
@@ -35,12 +81,22 @@ class VisionSettings(BaseSettings):
     """detection: find plate regions only (logs counts, no OCR/API reads). recognition: run EasyOCR on regions."""
     PLATE_DETECT_MIN_QUALITY_FOR_OCR: float = 0.05
     """Run OCR on crops with at least this detection quality (low = try more regions, including heuristics)."""
-    OCR_GPU: bool = False
-    """EasyOCR gpu=… (sample AdaptiveOCRProcessor)."""
+    OCR_GPU: bool = _DEFAULT_OCR_GPU
+    """EasyOCR / RapidOCR GPU. Auto-enabled when CUDA is available (e.g. T1000)."""
+    YOLO_DEVICE: str = _DEFAULT_YOLO_DEVICE
+    """YOLO inference device. Auto: cuda:0 if CUDA detected, else cpu. Override with YOLO_DEVICE env."""
+    YOLO_HALF: bool = _DEFAULT_YOLO_DEVICE.startswith("cuda")
+    """FP16 inference for YOLO on CUDA — halves VRAM, ~2× faster on T1000+. Auto-on for CUDA."""
+    YOLO_IMGSZ: int = 640
+    """Image size for plate-detector YOLO. 640 = best speed/accuracy on T1000."""
     PLATE_DETECTION_MODE: str = "opencv_roi"
     """Used when VISION_STACK=rapid: opencv_roi | fullframe."""
     PLATE_FILTER: str = "indian"
     """indian: HSRP-style layout only (stricter). loose: 4–12 alnum — more reads, occasional noise."""
+    PLATE_ALLOWED_STATES: str = "HR,DL,CH,UP"
+    """Comma-separated Indian state codes accepted by the validator. '*' = all states.
+    Default 'HR,DL,CH,UP' covers the NCR (Haryana / Delhi / Chandigarh / UP) school catchment
+    and rejects OCR garbage that would otherwise be 'corrected' into far-away state codes."""
     DEDUPE_SECONDS: float = 2.5
     """Min seconds between posting the same plate text again."""
     CAMERA_COOLDOWN_SEC: float = 15.0
@@ -66,4 +122,29 @@ class VisionSettings(BaseSettings):
 
 @lru_cache
 def get_settings() -> VisionSettings:
-    return VisionSettings()
+    s = VisionSettings()
+    # Propagate to env so YOLO loaders (singletons that read os.environ) honour the choice.
+    os.environ["YOLO_DEVICE"] = s.YOLO_DEVICE
+    os.environ["YOLO_HALF"] = "1" if s.YOLO_HALF else "0"
+    os.environ.setdefault("YOLO_IMGSZ", str(s.YOLO_IMGSZ))
+    os.environ["PLATE_ALLOWED_STATES"] = s.PLATE_ALLOWED_STATES
+    # Apply state-code restriction immediately so plate validator picks it up.
+    try:
+        from packages.shared.domain.plate import set_allowed_state_codes
+        codes = (
+            None if s.PLATE_ALLOWED_STATES.strip() in ("", "*")
+            else [c.strip() for c in s.PLATE_ALLOWED_STATES.split(",") if c.strip()]
+        )
+        if codes:
+            set_allowed_state_codes(codes)
+    except Exception:
+        pass
+    # Compute pool sizing — use all 24 cores aggressively on this i7
+    cpu = os.cpu_count() or 8
+    os.environ.setdefault("OMP_NUM_THREADS",      str(cpu))
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", str(cpu))
+    os.environ.setdefault("MKL_NUM_THREADS",      str(cpu))
+    os.environ.setdefault("NUMEXPR_NUM_THREADS",  str(cpu))
+    os.environ.setdefault("TORCH_NUM_THREADS",    str(cpu))
+    os.environ.setdefault("OPENCV_NUM_THREADS",   str(cpu))
+    return s

@@ -64,10 +64,26 @@ _MORPH = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
 def _get_ocr():
     global _engine
     if _engine is None:
-        from rapidocr_onnxruntime import RapidOCR
-
-        _engine = RapidOCR()
-        log.info("RapidOCR engine loaded")
+        # Prefer the GPU build of RapidOCR when CUDA is reachable.
+        ocr_gpu = False
+        try:
+            from apps.vision_worker.app.settings import get_settings
+            ocr_gpu = bool(get_settings().OCR_GPU)
+        except Exception:
+            pass
+        loaded = False
+        if ocr_gpu:
+            try:
+                from rapidocr_paddle import RapidOCR  # type: ignore
+                _engine = RapidOCR(det_use_cuda=True, rec_use_cuda=True, cls_use_cuda=True)
+                loaded = True
+                log.info("RapidOCR (paddle/CUDA) engine loaded")
+            except Exception as e:
+                log.info("RapidOCR paddle/CUDA unavailable (%s) — falling back to ONNX", e)
+        if not loaded:
+            from rapidocr_onnxruntime import RapidOCR
+            _engine = RapidOCR()
+            log.info("RapidOCR (onnxruntime CPU) engine loaded")
     return _engine
 
 
@@ -330,20 +346,50 @@ def _merge_two_line_plates(result: list) -> list:
 
     extra = list(result)
     dummy_bbox = result[0][0] if result and result[0] else []
+
+    # Two-line plate signature for stacked Indian HSRP:
+    #   Top row    : ST DD SR              (e.g. DL3CAB  or  HR26BF)
+    #   Bottom row : NNNN  (4-digit serial, e.g. 1234)
+    # We accept any A-Z/0-9 mix in either row and let the validator decide,
+    # because OCR sometimes splits the top into "DL" + "3CAB" giving us 3 rows.
     for i in range(len(row_texts) - 1):
         for j in range(i + 1, min(i + 3, len(row_texts))):
-            # Proximity gate: rows must be within 4× the taller row's height
+            # Proximity gate: rows must be within 4.5× the taller row's height.
+            # Slightly looser than before — stacked plates on a tilted bus
+            # produce row heights that differ by more than a single character.
             gap = abs(row_cy_list[j] - row_cy_list[i])
             max_h = max(row_heights[i], row_heights[j], 1.0)
-            if gap > max_h * 4.0:
-                continue  # rows are too far apart — different objects
+            if gap > max_h * 4.5:
+                continue
             ta, ca = row_texts[i]
             tb, cb = row_texts[j]
+            if not ta or not tb:
+                continue
             combined = ta + tb
             avg_conf = (ca + cb) / 2.0
+            # Stacked plates are always 8–10 characters once joined.
             if 6 <= len(combined) <= 12 and is_valid_plate_format(combined):
                 log.info("two-line merge: '%s' + '%s' → '%s' (conf=%.2f)",
                          ta, tb, combined, avg_conf)
+                extra.append([dummy_bbox, combined, avg_conf])
+
+    # Tri-line case (rare): "HR" / "26 BF" / "1234" — concat all three.
+    if len(row_texts) >= 3:
+        for i in range(len(row_texts) - 2):
+            ta, ca = row_texts[i]
+            tb, cb = row_texts[i + 1]
+            tc, cc = row_texts[i + 2]
+            if not (ta and tb and tc):
+                continue
+            gap_ab = abs(row_cy_list[i + 1] - row_cy_list[i])
+            gap_bc = abs(row_cy_list[i + 2] - row_cy_list[i + 1])
+            max_h = max(row_heights[i], row_heights[i + 1], row_heights[i + 2], 1.0)
+            if gap_ab > max_h * 4.5 or gap_bc > max_h * 4.5:
+                continue
+            combined = ta + tb + tc
+            if 6 <= len(combined) <= 12 and is_valid_plate_format(combined):
+                avg_conf = (ca + cb + cc) / 3.0
+                log.info("three-line merge: '%s'+'%s'+'%s' → '%s'", ta, tb, tc, combined)
                 extra.append([dummy_bbox, combined, avg_conf])
 
     return extra
@@ -643,11 +689,20 @@ def read_plates_from_frame(
 
             yolo = read_plates_from_frame._plate_yolo  # type: ignore[attr-defined]
             device = (os.environ.get("YOLO_DEVICE") or "cpu").strip()
+            half = os.environ.get("YOLO_HALF", "0").lower() in ("1", "true", "yes")
 
             # Run on 2× upscaled frame so small/distant plates cross detection threshold.
             # conf=0.08 — lower than default but not so low that every rectangle fires.
+            # On CUDA + FP16 the 2× cost is essentially free (~6ms on T1000).
+            try:
+                imgsz = int(os.environ.get("YOLO_IMGSZ", "0") or "0")
+            except ValueError:
+                imgsz = 0
             frame_up = cv2.resize(frame, (fw * 2, fh * 2), interpolation=cv2.INTER_LINEAR)
-            results = yolo(frame_up, conf=0.08, iou=0.4, device=device, verbose=False)
+            yolo_kwargs = dict(conf=0.08, iou=0.4, device=device, half=half, verbose=False)
+            if imgsz >= 320:
+                yolo_kwargs["imgsz"] = imgsz
+            results = yolo(frame_up, **yolo_kwargs)
 
             if results and results[0].boxes is not None and len(results[0].boxes):
                 log.info("plate YOLO: %d box(es)", len(results[0].boxes))

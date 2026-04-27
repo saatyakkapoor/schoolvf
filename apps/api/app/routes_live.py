@@ -37,12 +37,42 @@ _stream_health: dict[str, dict[str, Any]] = {}
 
 
 class DetectionIn(BaseModel):
-    plate_text: str
-    confidence: float = Field(ge=0.0, le=1.0)
+    """
+    Vision worker → API ingest payload.
+
+    `plate_text` is OPTIONAL: when the bus is too far / too blurry for plate OCR
+    but the route placard ("AR-29") is readable, the worker can post just the
+    route. The API then looks up the plate from the vehicle registry and flags
+    the row with `plate_from_storage=true` so the dashboard shows a yellow
+    triangle next to the auto-filled plate.
+
+    Symmetrically, `detected_route` is optional: when only a plate is read,
+    we still post — the dashboard simply shows the registered route from the
+    vehicle table (if the plate is registered).
+    """
+    plate_text: str | None = None
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     camera_id: str = "default"
     camera_name: str = "Camera"
     snapshot_base64: str | None = None
     detected_route: str | None = None   # route OCR'd from bus placard / LED display
+
+
+class ManualEntryIn(BaseModel):
+    """
+    Manual log entry from the dashboard.
+    Provide either `plate_text` OR `route_number` (or both):
+      - plate_text only       → registered route is auto-filled from vehicle registry
+      - route_number only     → plate is auto-filled from vehicle registry
+                                 (if the route maps to multiple vehicles, the first
+                                  active one is used and `plate_from_storage=true`).
+    """
+    plate_text: str | None = None
+    route_number: str | None = None
+    camera_id: str = "manual"
+    camera_name: str = "Manual entry"
+    notes: str | None = None
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
 class AdjustIn(BaseModel):
@@ -244,6 +274,48 @@ def _find_vehicle_route(db: Session, plate_text: str) -> dict[str, str] | None:
         "route_name": row.route_name or "",
         "driver_name": row.driver_name or "",
     }
+
+
+def _normalize_route_label(raw: str) -> str:
+    """
+    Accept any of: 'AR-29', 'ar 29', '29', 'AR29', 'AR-7' → return canonical 'AR-29'.
+    Returns original (uppercased, stripped) if not parseable.
+    """
+    if not raw:
+        return ""
+    cleaned = raw.strip().upper().replace(" ", "").replace("_", "")
+    # already canonical AR-NN
+    if cleaned.startswith("AR-") and cleaned[3:].isdigit():
+        return f"AR-{int(cleaned[3:]):02d}"
+    if cleaned.startswith("AR") and cleaned[2:].isdigit():
+        return f"AR-{int(cleaned[2:]):02d}"
+    if cleaned.isdigit():
+        return f"AR-{int(cleaned):02d}"
+    return cleaned
+
+
+def _find_vehicle_by_route(db: Session, route_number: str) -> AppVehicle | None:
+    """
+    Look up an active vehicle by route number. The vehicle table can have multiple
+    plates per route (relief buses); prefer an exact, active match and fall back
+    to a case-insensitive match on the canonicalised route label.
+    """
+    if not route_number:
+        return None
+    canon = _normalize_route_label(route_number)
+    candidates = [route_number.strip().upper()]
+    if canon and canon not in candidates:
+        candidates.append(canon)
+    # Strip 'AR-' prefix as another fallback (some users register routes as just '29')
+    if canon.startswith("AR-"):
+        bare = canon[3:].lstrip("0") or canon[3:]
+        if bare not in candidates:
+            candidates.append(bare)
+    q = db.query(AppVehicle).filter(
+        AppVehicle.is_active.is_(True),
+        AppVehicle.route_number.in_(candidates),
+    )
+    return q.order_by(AppVehicle.created_at.asc()).first()
 
 
 def _find_camera_url(db: Session, camera_id: str) -> str | None:
@@ -460,61 +532,133 @@ def stream_health(
     return _stream_health.get(camera_id, {"connected": False, "fps": 0.0, "last_frame": None})
 
 
+def _build_detection_row(
+    db: Session,
+    *,
+    event_id: str,
+    plate_text: str | None,
+    confidence: float,
+    camera_id: str,
+    camera_name: str,
+    snapshot_base64: str | None,
+    detected_route: str | None,
+    detected_at: datetime,
+    source: str = "vision",
+    notes: str | None = None,
+) -> dict[str, Any]:
+    """
+    Compose the in-memory detection row. Handles all four input cases:
+      1. plate + route   → standard read
+      2. plate only       → route filled from registry (if registered)
+      3. route only       → plate auto-filled from registry → plate_from_storage=true
+      4. neither          → caller should reject (we still emit a debug-only row)
+    """
+    plate_clean = (plate_text or "").strip().upper() or None
+    detected_route_norm = _normalize_route_label(detected_route or "") or None
+
+    plate_from_storage = False
+    vehicle: AppVehicle | None = None
+
+    if plate_clean:
+        # Look up by plate first (path 1 + 2)
+        vehicle = (
+            db.query(AppVehicle)
+            .filter(AppVehicle.plate_number == plate_clean, AppVehicle.is_active.is_(True))
+            .first()
+        )
+    elif detected_route_norm:
+        # Path 3: plate missing — try to fill from registry by route
+        vehicle = _find_vehicle_by_route(db, detected_route_norm)
+        if vehicle is not None:
+            plate_clean = vehicle.plate_number
+            plate_from_storage = True
+
+    registered_route = ((vehicle.route_number or "").strip().upper()) if vehicle else ""
+    route_name = (vehicle.route_name or "") if vehicle else ""
+    driver_name = (vehicle.driver_name or "") if vehicle else ""
+    is_registered = vehicle is not None
+
+    # Mismatch logic (only meaningful when *both* sides are known and the plate
+    # was actually detected, not auto-filled from storage).
+    is_mismatch = bool(
+        not plate_from_storage
+        and detected_route_norm
+        and (
+            (registered_route and detected_route_norm != registered_route)
+            or (not registered_route)
+        )
+    )
+
+    return {
+        "id": event_id,
+        "type": "plate",
+        "plate_text": plate_clean or "",
+        "confidence": confidence,
+        "camera_id": camera_id,
+        "camera_name": camera_name,
+        "snapshot_base64": snapshot_base64,
+        "detected_at": detected_at.isoformat(),
+        "route_number": registered_route,
+        "route_name": route_name,
+        "driver_name": driver_name,
+        "is_registered": is_registered,
+        "detected_route": detected_route_norm,
+        "is_mismatch": is_mismatch,
+        "plate_from_storage": plate_from_storage,
+        "has_plate": bool(plate_clean) and not plate_from_storage,
+        "has_route": bool(detected_route_norm),
+        "source": source,
+        "notes": notes,
+    }
+
+
 @router.post("/live/detections")
 async def ingest_detection(
     body: DetectionIn,
     db: Session = Depends(get_db),
     x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
 ) -> dict[str, str]:
-    """Vision worker calls this to ingest a plate detection."""
+    """Vision worker calls this to ingest a plate detection (or a route-only sighting)."""
     settings = get_api_settings()
     if not x_internal_token or x_internal_token != settings.INTERNAL_INGEST_SECRET:
         raise HTTPException(status_code=403, detail="Invalid internal token")
+
+    plate_in = (body.plate_text or "").strip().upper() or None
+    route_in = (body.detected_route or "").strip().upper() or None
+    if not plate_in and not route_in:
+        raise HTTPException(status_code=422, detail="Either plate_text or detected_route is required")
+
     event_id = uuid.uuid4().hex[:16]
     ts_dt = datetime.now(timezone.utc)
-    ts = ts_dt.isoformat()
-    plate_clean = body.plate_text.strip().upper()
-    detected_route = (body.detected_route or "").strip().upper() or None
-    vehicle_info = _find_vehicle_route(db, plate_clean)
-    registered_route = vehicle_info["route_number"].strip().upper() if vehicle_info else ""
 
-    # Mismatch conditions:
-    #   1. Bus shows a route that conflicts with its DB registration
-    #   2. Bus shows a route but its plate is not registered at all (unknown bus on a route)
-    is_mismatch = bool(
-        detected_route and (
-            (registered_route and detected_route != registered_route)
-            or (not registered_route)  # unknown plate displaying a school route
-        )
+    row = _build_detection_row(
+        db,
+        event_id=event_id,
+        plate_text=plate_in,
+        confidence=body.confidence,
+        camera_id=body.camera_id,
+        camera_name=body.camera_name,
+        snapshot_base64=body.snapshot_base64,
+        detected_route=route_in,
+        detected_at=ts_dt,
+        source="vision",
     )
 
-    row = {
-        "id": event_id,
-        "type": "plate",
-        "plate_text": plate_clean,
-        "confidence": body.confidence,
-        "camera_id": body.camera_id,
-        "camera_name": body.camera_name,
-        "snapshot_base64": body.snapshot_base64,
-        "detected_at": ts,
-        "route_number": registered_route,
-        "route_name": vehicle_info["route_name"] if vehicle_info else "",
-        "driver_name": vehicle_info["driver_name"] if vehicle_info else "",
-        "is_registered": vehicle_info is not None,
-        "detected_route": detected_route,
-        "is_mismatch": is_mismatch,
-    }
+    plate_clean = row["plate_text"]
     try:
-        process_detection_for_trips(
-            db,
-            camera_id=body.camera_id,
-            camera_name=body.camera_name,
-            plate_number=plate_clean,
-            confidence=body.confidence,
-            snapshot_base64=body.snapshot_base64,
-            detected_at=ts_dt,
-        )
-        db.commit()
+        # Only run the trip pipeline when we have a real plate to anchor on
+        # (route-only sightings without a known vehicle don't represent a gate event).
+        if plate_clean:
+            process_detection_for_trips(
+                db,
+                camera_id=body.camera_id,
+                camera_name=body.camera_name,
+                plate_number=plate_clean,
+                confidence=body.confidence,
+                snapshot_base64=body.snapshot_base64,
+                detected_at=ts_dt,
+            )
+            db.commit()
     except Exception:
         db.rollback()
         raise
@@ -529,10 +673,90 @@ async def ingest_detection(
             "camera_name": row["camera_name"],
             "has_snapshot": bool(body.snapshot_base64),
             "event_id": event_id,
+            "plate_from_storage": row["plate_from_storage"],
+            "detected_route": row["detected_route"],
         },
         source="api",
     )
     return {"status": "ok", "id": event_id}
+
+
+@router.post("/live/manual-detection")
+async def manual_detection(
+    body: ManualEntryIn,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_username),
+) -> dict[str, Any]:
+    """
+    Operator-driven manual log entry.
+
+    Use cases:
+      - Camera missed a bus that just rolled in → enter the route number,
+        we look up the registered plate and post a detection row.
+      - Bus has temporary plates → enter just the plate, route is auto-filled
+        from the registry if the plate is recognised.
+    """
+    plate_in = (body.plate_text or "").strip().upper() or None
+    route_in = _normalize_route_label(body.route_number or "") or None
+    if not plate_in and not route_in:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide at least one of plate_text or route_number",
+        )
+
+    event_id = uuid.uuid4().hex[:16]
+    ts_dt = datetime.now(timezone.utc)
+
+    row = _build_detection_row(
+        db,
+        event_id=event_id,
+        plate_text=plate_in,
+        confidence=body.confidence,
+        camera_id=body.camera_id or "manual",
+        camera_name=body.camera_name or f"Manual entry · {username}",
+        snapshot_base64=None,
+        detected_route=route_in,
+        detected_at=ts_dt,
+        source="manual",
+        notes=body.notes,
+    )
+
+    if not row["plate_text"] and route_in:
+        # Route given but no vehicle is registered for it — keep the row but flag clearly.
+        row["plate_text"] = ""
+        row["plate_from_storage"] = False
+
+    plate_clean = row["plate_text"]
+    try:
+        if plate_clean:
+            process_detection_for_trips(
+                db,
+                camera_id=row["camera_id"],
+                camera_name=row["camera_name"],
+                plate_number=plate_clean,
+                confidence=body.confidence,
+                snapshot_base64=None,
+                detected_at=ts_dt,
+            )
+            db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    _recent.appendleft(row)
+    await manager.broadcast({"type": "detection", "payload": row})
+    await _push_debug_event(
+        "manual_entry",
+        {
+            "plate_text": row["plate_text"],
+            "detected_route": row["detected_route"],
+            "by": username,
+            "plate_from_storage": row["plate_from_storage"],
+            "notes": body.notes,
+        },
+        source="api",
+    )
+    return {"status": "ok", "id": event_id, "row": row}
 
 
 @router.post("/live/debug")

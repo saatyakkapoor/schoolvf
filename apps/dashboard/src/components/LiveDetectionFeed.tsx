@@ -11,16 +11,23 @@ import FiberManualRecordIcon from "@mui/icons-material/FiberManualRecord";
 import SwapHorizIcon from "@mui/icons-material/SwapHoriz";
 import WarningAmberIcon from "@mui/icons-material/WarningAmber";
 import CheckCircleIcon from "@mui/icons-material/CheckCircle";
+import EditNoteIcon from "@mui/icons-material/EditNote";
 import {
   Alert,
+  Autocomplete,
   Box,
   Button,
   Chip,
   CircularProgress,
   Collapse,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
   Divider,
   FormControl,
   FormControlLabel,
+  IconButton,
   List,
   ListItem,
   Radio,
@@ -31,12 +38,14 @@ import {
   Tooltip,
   Typography,
 } from "@mui/material";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import AddIcon from "@mui/icons-material/Add";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
-import { adjustDetection, getLiveRecent } from "../api/live";
+import { adjustDetection, getLiveRecent, submitManualDetection } from "../api/live";
+import { getVehicles } from "../api/vehicles";
 import { useLiveWebSocket } from "../hooks/useLiveWebSocket";
-import type { LiveDetection } from "../types";
+import type { LiveDetection, Vehicle } from "../types";
 
 interface LiveDetectionFeedProps {
   maxItems?: number;
@@ -157,16 +166,138 @@ function AdjustForm({ row, onDone }: { row: LiveDetection; onDone: () => void })
   );
 }
 
+function ManualEntryDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const qc = useQueryClient();
+  const [plateText, setPlateText] = useState("");
+  const [routeNumber, setRouteNumber] = useState("");
+  const [notes, setNotes] = useState("");
+
+  // Vehicle list powers two autocompletes: one over plates, one over routes.
+  const { data: vehicles = [] } = useQuery({
+    queryKey: ["vehicles", "active"],
+    queryFn: () => getVehicles(true),
+    staleTime: 30_000,
+    enabled: open,
+  });
+
+  const plateOptions = vehicles.map((v: Vehicle) => v.plate_number);
+  const routeOptions = Array.from(
+    new Set(vehicles.map((v: Vehicle) => v.route_number).filter(Boolean)),
+  );
+
+  const mut = useMutation({
+    mutationFn: () =>
+      submitManualDetection({
+        plate_text: plateText.trim().toUpperCase() || undefined,
+        route_number: routeNumber.trim().toUpperCase() || undefined,
+        notes: notes.trim() || undefined,
+        confidence: 1.0,
+      }),
+    onSuccess: () => {
+      // Refresh recent list after successful entry; the WS broadcast will
+      // also push the row, but invalidation keeps the cached query consistent.
+      qc.invalidateQueries({ queryKey: ["live", "recent", 100] });
+      setPlateText("");
+      setRouteNumber("");
+      setNotes("");
+      onClose();
+    },
+  });
+
+  const canSubmit = (plateText.trim() || routeNumber.trim()) && !mut.isPending;
+
+  return (
+    <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth>
+      <DialogTitle sx={{ pb: 0.5 }}>
+        <Stack direction="row" alignItems="center" spacing={1}>
+          <EditNoteIcon color="primary" />
+          <Typography variant="h6" component="span">Manual log entry</Typography>
+        </Stack>
+        <Typography variant="caption" color="text.secondary">
+          Provide a plate number, a route number (e.g. AR-29), or both. The other field
+          is auto-filled from the vehicle registry when possible.
+        </Typography>
+      </DialogTitle>
+      <DialogContent sx={{ pt: 2 }}>
+        <Stack spacing={2}>
+          <Autocomplete
+            freeSolo
+            options={plateOptions}
+            value={plateText}
+            onInputChange={(_, v) => setPlateText(v.toUpperCase())}
+            renderInput={(params) => (
+              <TextField
+                {...params}
+                label="Plate number"
+                placeholder="e.g. HR26BF1234"
+                size="small"
+                helperText="Leave empty if you only know the route number."
+              />
+            )}
+          />
+          <Autocomplete
+            freeSolo
+            options={routeOptions}
+            value={routeNumber}
+            onInputChange={(_, v) => setRouteNumber(v.toUpperCase())}
+            renderInput={(params) => (
+              <TextField
+                {...params}
+                label="Route number"
+                placeholder="e.g. AR-29 or 29"
+                size="small"
+                helperText="If only the route is provided, the plate is filled from storage."
+              />
+            )}
+          />
+          <TextField
+            label="Notes (optional)"
+            size="small"
+            multiline
+            minRows={2}
+            value={notes}
+            onChange={(e) => setNotes(e.target.value)}
+          />
+          {mut.isError && (
+            <Alert severity="error">Could not save the entry. Please retry.</Alert>
+          )}
+        </Stack>
+      </DialogContent>
+      <DialogActions sx={{ px: 3, pb: 2 }}>
+        <Button onClick={onClose} disabled={mut.isPending}>Cancel</Button>
+        <Button
+          variant="contained"
+          startIcon={mut.isPending ? <CircularProgress size={14} /> : <AddIcon />}
+          disabled={!canSubmit}
+          onClick={() => mut.mutate()}
+        >
+          Add entry
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+
 function DetectionRow({ row }: { row: LiveDetection }) {
   const hasRoute = row.is_registered && row.route_number;
   const isMismatch = row.is_mismatch && !row.swap_resolved;
   const isResolved = row.is_mismatch && row.swap_resolved;
+  const isManual = row.source === "manual";
+  const plateFromStorage = !!row.plate_from_storage;
+  // Partial read: only the route was visible (no plate read AND no storage match)
+  const routeOnly = !row.plate_text && !!row.detected_route;
+  // Plate visible but route missing — fine, just no warning chip
   const [adjustOpen, setAdjustOpen] = useState(false);
 
   const borderColor = isMismatch
     ? "rgba(255,152,0,0.6)"
     : isResolved
     ? "rgba(76,175,80,0.4)"
+    : plateFromStorage
+    ? "rgba(255,235,59,0.55)"
+    : isManual
+    ? "rgba(33,150,243,0.5)"
     : "transparent";
 
   return (
@@ -209,17 +340,63 @@ function DetectionRow({ row }: { row: LiveDetection }) {
         {/* Plate + meta */}
         <Box flex={1} minWidth={0}>
           <Stack direction="row" alignItems="center" spacing={0.75} flexWrap="wrap" useFlexGap>
-            <Typography
-              variant="body2" fontWeight={700} fontFamily="monospace"
-              sx={{ letterSpacing: 1.5, color: isMismatch ? "warning.main" : hasRoute ? "#FFD700" : "text.primary" }}
-            >
-              {row.plate_text}
-            </Typography>
-            <ConfidenceBadge value={row.confidence} />
+            {/* Yellow triangle when the plate text was filled from storage because
+                the camera couldn't read it but the route placard was visible */}
+            {plateFromStorage && (
+              <Tooltip
+                title="Plate auto-filled from vehicle registry (camera saw the route placard but the plate was not readable)"
+                arrow
+              >
+                <WarningAmberIcon sx={{ fontSize: 18, color: "#FFEB3B" }} />
+              </Tooltip>
+            )}
+            {row.plate_text ? (
+              <Typography
+                variant="body2" fontWeight={700} fontFamily="monospace"
+                sx={{
+                  letterSpacing: 1.5,
+                  color: isMismatch
+                    ? "warning.main"
+                    : plateFromStorage
+                    ? "#FFEB3B"
+                    : hasRoute
+                    ? "#FFD700"
+                    : "text.primary",
+                  textDecoration: plateFromStorage ? "underline dotted" : "none",
+                }}
+              >
+                {row.plate_text}
+              </Typography>
+            ) : (
+              <Tooltip title="Plate not readable — only the route placard was visible" arrow>
+                <Chip
+                  icon={<WarningAmberIcon sx={{ fontSize: "12px !important" }} />}
+                  label="No plate read"
+                  size="small"
+                  variant="outlined"
+                  sx={{ height: 20, fontSize: 11, color: "#FFEB3B", borderColor: "rgba(255,235,59,0.5)" }}
+                />
+              </Tooltip>
+            )}
+            {!routeOnly && row.confidence > 0 && <ConfidenceBadge value={row.confidence} />}
 
             {/* Registered route from DB */}
             {hasRoute && (
               <RouteBadge routeNumber={row.route_number!} routeName={row.route_name || ""} driverName={row.driver_name} />
+            )}
+
+            {/* Source = manual entry — small badge so operators can tell apart */}
+            {isManual && (
+              <Tooltip title="Entered manually from the dashboard" arrow>
+                <Chip
+                  icon={<EditNoteIcon sx={{ fontSize: "12px !important" }} />}
+                  label="Manual"
+                  size="small"
+                  color="info"
+                  variant="outlined"
+                  sx={{ height: 20, fontSize: 11 }}
+                />
+              </Tooltip>
             )}
 
             {/* Detected route from bus placard / LED display — always show when present */}
@@ -305,6 +482,7 @@ function DetectionRow({ row }: { row: LiveDetection }) {
 
 export default function LiveDetectionFeed({ maxItems = 60, height = 400, cameraId }: LiveDetectionFeedProps) {
   const { connected, recent, snapshotReceived } = useLiveWebSocket();
+  const [manualOpen, setManualOpen] = useState(false);
 
   const { data: restData, isLoading } = useQuery({
     queryKey: ["live", "recent", 100],
@@ -332,8 +510,20 @@ export default function LiveDetectionFeed({ maxItems = 60, height = 400, cameraI
           }}
         />
         <Typography variant="subtitle2" sx={{ flex: 1 }}>Plate detections</Typography>
+        <Tooltip title="Add a manual log entry (plate, route, or both)" arrow>
+          <IconButton
+            size="small"
+            color="primary"
+            onClick={() => setManualOpen(true)}
+            sx={{ mr: 0.5 }}
+            aria-label="Add manual log entry"
+          >
+            <AddIcon fontSize="small" />
+          </IconButton>
+        </Tooltip>
         <Typography variant="caption" color="text.secondary">{connected ? "Live" : "Connecting…"}</Typography>
       </Stack>
+      <ManualEntryDialog open={manualOpen} onClose={() => setManualOpen(false)} />
 
       {/* List */}
       <Box sx={{ overflowY: "auto", flex: 1 }}>

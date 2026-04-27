@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 
 # Default: alphanumeric plates, typical school bus / regional plates (tune per deployment)
@@ -16,12 +17,53 @@ _BH_PLATE_PATTERN = re.compile(r"^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$")
 # ---------------------------------------------------------------------------
 # All valid Indian state / UT codes (used to correct OCR state-code errors)
 # ---------------------------------------------------------------------------
-_VALID_STATE_CODES: frozenset[str] = frozenset({
+_ALL_INDIAN_STATE_CODES: frozenset[str] = frozenset({
     "AN", "AP", "AR", "AS", "BR", "CG", "CH", "DD", "DL", "DN", "GA", "GJ",
     "HP", "HR", "JH", "JK", "KA", "KL", "LA", "LD", "MH", "ML", "MN", "MP",
     "MZ", "NL", "OD", "PB", "PY", "RJ", "SK", "TN", "TG", "TR", "TS", "UK",
     "UP", "WB",
 })
+
+# ---------------------------------------------------------------------------
+# Deployment-restricted state codes
+# In TSRS Aravali school deployment we ONLY ever see HR / DL / CH / UP plates
+# (Haryana / Delhi / Chandigarh / Uttar Pradesh — all NCR). Restricting the
+# validator to this allow-list dramatically reduces false positives because
+# the state-code corrector will refuse to "fix" garbage OCR into AP/KA/MH
+# plates that physically can't be at this gate.
+#
+# Override at runtime with PLATE_ALLOWED_STATES env var, e.g.
+#   PLATE_ALLOWED_STATES=HR,DL,CH,UP   (default)
+#   PLATE_ALLOWED_STATES=*             (accept all Indian codes)
+# ---------------------------------------------------------------------------
+_DEFAULT_ALLOWED = frozenset({"HR", "DL", "CH", "UP"})
+
+
+def _read_allowed_states_from_env() -> frozenset[str]:
+    raw = (os.environ.get("PLATE_ALLOWED_STATES") or "").strip()
+    if not raw:
+        return _DEFAULT_ALLOWED
+    if raw == "*":
+        return _ALL_INDIAN_STATE_CODES
+    parts = {p.strip().upper() for p in raw.split(",") if p.strip()}
+    valid = parts & _ALL_INDIAN_STATE_CODES
+    return frozenset(valid) if valid else _DEFAULT_ALLOWED
+
+
+_VALID_STATE_CODES: frozenset[str] = _read_allowed_states_from_env()
+
+
+def get_allowed_state_codes() -> frozenset[str]:
+    """Currently active allow-list of Indian state codes."""
+    return _VALID_STATE_CODES
+
+
+def set_allowed_state_codes(codes: frozenset[str] | set[str] | list[str] | tuple[str, ...]) -> None:
+    """Override the allow-list at runtime (used by tests / hot config)."""
+    global _VALID_STATE_CODES
+    cleaned = {str(c).strip().upper() for c in codes if str(c).strip()}
+    valid = cleaned & _ALL_INDIAN_STATE_CODES
+    _VALID_STATE_CODES = frozenset(valid) if valid else _DEFAULT_ALLOWED
 
 # ---------------------------------------------------------------------------
 # OCR confusion correction

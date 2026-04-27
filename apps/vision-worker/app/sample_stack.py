@@ -325,6 +325,72 @@ def _bbox_left_x(bbox: Any) -> float:
     return float(arr[:, 0].min())
 
 
+def _bbox_top_y(bbox: Any) -> float:
+    arr = np.asarray(bbox, dtype=np.float64)
+    return float(arr[:, 1].min())
+
+
+def _bbox_height(bbox: Any) -> float:
+    arr = np.asarray(bbox, dtype=np.float64)
+    return float(arr[:, 1].max() - arr[:, 1].min())
+
+
+def _stacked_two_line_merge(results: list) -> list[tuple[str, float]]:
+    """
+    Reconstruct two-line stacked Indian plates from EasyOCR results.
+
+    Indian school buses use HSRP plates that are often two-line:
+        Top:    DL3C AB
+        Bottom: 1234
+    EasyOCR returns each line as a separate result; this function clusters
+    them into rows by Y-centre proximity, sorts each row L→R, and emits
+    candidate strings ordered top→bottom.
+    """
+    if not results or len(results) < 2:
+        return []
+    items: list[tuple[float, float, float, str, float]] = []  # (y_top, y_height, x_left, text, conf)
+    for bbox, text, conf in results:
+        try:
+            t = re.sub(r"[^A-Z0-9]", "", str(text).upper())
+            if not t:
+                continue
+            items.append((_bbox_top_y(bbox), _bbox_height(bbox), _bbox_left_x(bbox), t, float(conf)))
+        except Exception:
+            continue
+    if len(items) < 2:
+        return []
+    items.sort(key=lambda r: r[0])
+    rows: list[list[tuple[float, float, float, str, float]]] = []
+    for it in items:
+        placed = False
+        for row in rows:
+            row_y = sum(r[0] for r in row) / len(row)
+            row_h = max(r[1] for r in row)
+            if abs(it[0] - row_y) < max(row_h * 0.7, 6.0):
+                row.append(it)
+                placed = True
+                break
+        if not placed:
+            rows.append([it])
+    if len(rows) < 2:
+        return []
+    rows.sort(key=lambda row: sum(r[0] for r in row) / len(row))
+    out: list[tuple[str, float]] = []
+    # Concat top→bottom across the first 2-3 rows.
+    for take in (2, 3):
+        if len(rows) < take:
+            continue
+        merged_text = ""
+        confs: list[float] = []
+        for row in rows[:take]:
+            row.sort(key=lambda r: r[2])  # left to right
+            merged_text += "".join(r[3] for r in row)
+            confs.extend(r[4] for r in row)
+        if 6 <= len(merged_text) <= 12 and confs:
+            out.append((merged_text, sum(confs) / len(confs)))
+    return out
+
+
 def _easyocr_read_roi(
     roi: np.ndarray, reader: Any, *, ocr_min: float
 ) -> tuple[str | None, float]:
@@ -377,7 +443,18 @@ def _easyocr_read_roi(
             if merged_clean and avg_conf >= frag_floor and (
                 best_text is None or len(merged_clean) > len(best_text)
             ):
-                return merged_clean, min(0.99, avg_conf)
+                best_text, best_conf = merged_clean, min(0.99, avg_conf)
+
+        # Stacked two-line plate fallback: top→bottom row concat (DLABC / 1234).
+        # Always try this — if it produces a valid Indian-format plate, prefer it.
+        for stacked_text, stacked_conf in _stacked_two_line_merge(results):
+            cleaned = _fast_text_cleaning(stacked_text)
+            if not cleaned:
+                continue
+            if validate_and_correct_indian(cleaned) is not None and (
+                best_text is None or len(cleaned) > len(best_text)
+            ):
+                return cleaned, min(0.99, stacked_conf)
 
         return best_text, best_conf
     except Exception as e:

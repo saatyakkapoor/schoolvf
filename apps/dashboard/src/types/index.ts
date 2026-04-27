@@ -189,6 +189,29 @@ export interface LiveDetection {
   swap_notes?: string | null;
   swap_resolved?: boolean;
   swap_resolved_by?: string | null;
+  /**
+   * True when the plate text was filled from the vehicle registry because the
+   * camera saw the route placard but couldn't read the plate. UI shows a
+   * yellow triangle next to the plate when this is set.
+   */
+  plate_from_storage?: boolean;
+  /** Plate was actually read by the camera (not auto-filled from storage). */
+  has_plate?: boolean;
+  /** Route was actually read from the placard / LED display. */
+  has_route?: boolean;
+  /** "vision" = camera worker; "manual" = operator entry from the dashboard. */
+  source?: "vision" | "manual" | string;
+  /** Operator notes on a manual entry. */
+  notes?: string | null;
+}
+
+export interface ManualEntryPayload {
+  plate_text?: string;
+  route_number?: string;
+  camera_id?: string;
+  camera_name?: string;
+  notes?: string;
+  confidence?: number;
 }
 
 /** Structured pipeline / ingest debug (GET /live/debug, WebSocket `debug`). */
