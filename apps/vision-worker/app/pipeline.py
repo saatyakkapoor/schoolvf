@@ -231,34 +231,107 @@ _RTSP_OPTS = "rtsp_transport;tcp|fflags|nobuffer|flags|low_delay|max_delay|0"
 
 
 def _frame_sharpness(frame: "np.ndarray") -> float:
-    """Laplacian variance — higher = sharper / less motion blur."""
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    """Laplacian variance — higher = sharper / less motion blur.
+
+    Computed on a downsampled copy (320 wide) so picking the sharpest of
+    4 candidates costs ~3 ms total instead of ~80 ms on full HD.
+    """
+    h, w = frame.shape[:2]
+    if w > 320:
+        sc = 320 / w
+        frame = cv2.resize(frame, (320, int(h * sc)), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
-def _grab_sharpest_frame(cap: Any, *, burst: int = 4, drain: int = 1) -> tuple[bool, Any]:
+class _LatestFrameBuffer:
+    """Background thread: pulls frames from `cap` as fast as the camera produces
+    them and keeps only the most recent `history` decoded frames.
+
+    Why this exists: when OCR takes longer than 1/fps, the underlying ffmpeg
+    queue piles up and `cap.read()` returns 2-5 second-old footage. Solution
+    is the standard one used by every real-time vision app — a dedicated
+    grabber thread that drops everything older than the most recent frame,
+    so the OCR loop always sees *now*.
+
+    The buffer also holds a tiny ring of the latest frames (default 4 ≈ 130ms
+    at 30fps) so we can pick the sharpest of those for OCR — defence against
+    motion blur, but only across genuinely current frames.
     """
-    Grab `burst` frames back-to-back, return the sharpest one.
-    This is the primary defence against motion blur on a moving bus:
-    in any burst of 4 frames, at least one is usually significantly sharper
-    than the others because of the rolling shutter cycle.
-    Cost: burst × (1/fps) ≈ 4 × 33ms = ~130ms for a 30fps RTSP stream —
-    cheap compared to OCR time.
-    """
-    best_frame = None
-    best_score = -1.0
-    for _ in range(burst):
-        ok, frame = _grab_latest_frame(cap, drain=drain)
-        if not ok or frame is None:
-            continue
-        score = _frame_sharpness(frame)
-        if score > best_score:
-            best_score = score
-            best_frame = frame
-    if best_frame is None:
-        return False, None
-    log.debug("burst sharpness best=%.1f", best_score)
-    return True, best_frame
+
+    def __init__(self, cap: Any, *, history: int = 4) -> None:
+        self._cap = cap
+        self._history = max(1, int(history))
+        self._frames: list[tuple[float, Any]] = []  # oldest → newest
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._consec_grab_fails = 0
+        self._thread = threading.Thread(
+            target=self._run, name="rtsp-grabber", daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                ok = self._cap.grab()
+            except Exception as e:
+                log.debug("grabber: cap.grab() raised %s", e)
+                ok = False
+            if not ok:
+                self._consec_grab_fails += 1
+                if self._consec_grab_fails > 50:
+                    # Surface persistent grab failures so the outer loop reconnects
+                    log.warning("grabber: %d consecutive grab failures", self._consec_grab_fails)
+                    self._consec_grab_fails = 0
+                # Tiny sleep so we don't burn CPU when the stream is dead
+                time.sleep(0.02)
+                continue
+            self._consec_grab_fails = 0
+            try:
+                ok2, frame = self._cap.retrieve()
+            except Exception:
+                continue
+            if not ok2 or frame is None:
+                continue
+            with self._lock:
+                self._frames.append((time.time(), frame))
+                if len(self._frames) > self._history:
+                    # Drop the oldest; we only ever care about the latest
+                    self._frames = self._frames[-self._history:]
+
+    def latest_sharpest(self, *, max_age_sec: float = 1.5) -> tuple[bool, Any, float]:
+        """Return (ok, frame, captured_at_ts).
+
+        Picks the sharpest frame from the in-memory ring (which only ever
+        contains the most recent ~history frames). Anything older than
+        `max_age_sec` is discarded so a stalled stream can't return ancient
+        footage.
+        """
+        with self._lock:
+            snapshot = list(self._frames)
+        if not snapshot:
+            return False, None, 0.0
+        now = time.time()
+        fresh = [(ts, f) for ts, f in snapshot if (now - ts) <= max_age_sec]
+        if not fresh:
+            # Stream is producing frames but they're all old → caller should
+            # treat this as a failure and reconnect.
+            return False, None, snapshot[-1][0]
+        best_frame = None
+        best_score = -1.0
+        best_ts = 0.0
+        for ts, frame in fresh:
+            score = _frame_sharpness(frame)
+            if score > best_score:
+                best_score = score
+                best_frame = frame
+                best_ts = ts
+        return True, best_frame, best_ts
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2.0)
 _LAST_LIVE_DEBUG_POST = 0.0
 _LIVE_DEBUG_INTERVAL_SEC = 3.0
 
@@ -643,29 +716,41 @@ def run_rtsp_loop(
             time.sleep(30.0)
             continue
 
+        # Background grabber thread → OCR loop only ever sees fresh frames.
+        # This is the *only* defence against the "OCR is showing a 5-second old
+        # plate" backlog problem; cv2's BUFFERSIZE=1 + nobuffer flags help but
+        # don't fully prevent the queue from filling when OCR is slower than
+        # the camera FPS.
+        grabber = _LatestFrameBuffer(cap, history=4)
         try:
-            drain = max(1, int(getattr(s, "RTSP_GRAB_DRAIN", 1)))
             frame_n = 0
             last_heartbeat = time.time()
             recent_cam: dict[str, tuple[float, str]] = {}  # per-camera cooldown tracker
+            startup_deadline = time.time() + 8.0
+            stale_count = 0
             while True:
                 if stop_event is not None and stop_event.is_set():
                     log.info("Stop requested for camera %s — closing capture", cid)
                     return
-                # Grab a burst of 4 frames and keep the sharpest — kills motion blur
-                ok, frame = _grab_sharpest_frame(cap, burst=4, drain=drain)
+                # Pull the sharpest of the latest frames *currently* in memory.
+                # Anything older than 1.5s is rejected so we never OCR stale footage.
+                ok, frame, captured_at = grabber.latest_sharpest(max_age_sec=1.5)
                 if not ok or frame is None:
-                    log.warning("Frame grab failed, retrying…")
-                    time.sleep(1.0)
+                    if time.time() > startup_deadline and stale_count > 25:
+                        log.warning("Frames went stale (>1.5s old) — reconnecting RTSP")
+                        break
+                    stale_count += 1
+                    time.sleep(0.05)
                     continue
+                stale_count = 0
+                frame_age_ms = int((time.time() - captured_at) * 1000)
                 frame_n += 1
 
                 # Heartbeat every 30s so we know the thread is alive even with slow OCR
                 now = time.time()
                 if now - last_heartbeat >= 30.0:
                     last_heartbeat = now
-                    log.info("camera %s alive — frame #%d (OCR running, ~%.1fs/frame)",
-                             cid, frame_n, (now - last_heartbeat + 30.0) / max(frame_n, 1))
+                    log.info("camera %s alive — frame #%d", cid, frame_n)
 
                 strict_indian = s.PLATE_FILTER.strip().lower() == "indian"
 
@@ -688,7 +773,11 @@ def run_rtsp_loop(
                 plates = _plate_fut.result()
                 route: str | None = None
                 try:
-                    route = _route_fut.result(timeout=10)
+                    # Tight timeout: route OCR runs in parallel with plate OCR
+                    # but should never extend the cycle by more than 1.5s. If
+                    # it's slower than that we'd rather skip the route number
+                    # for this frame than fall behind real-time.
+                    route = _route_fut.result(timeout=1.5)
                 except Exception as _re:
                     log.debug("route OCR timeout/error: %s", _re)
                 ocr_ms = int((time.time() - t_ocr) * 1000)
@@ -696,10 +785,20 @@ def run_rtsp_loop(
 
                 # Always log OCR timing every 10 frames so we can debug slow performance
                 if frame_n % 10 == 0:
-                    log.info("camera %s frame#%d ocr=%dms plates=%s route=%s",
-                             cid, frame_n, ocr_ms,
-                             [p for p, _ in plates] if plates else "none",
-                             route or "none")
+                    log.info(
+                        "camera %s frame#%d age=%dms ocr=%dms plates=%s route=%s",
+                        cid, frame_n, frame_age_ms, ocr_ms,
+                        [p for p, _ in plates] if plates else "none",
+                        route or "none",
+                    )
+                # Loud warning if frames are getting stale — exposes backlog
+                # problems immediately in the docker logs.
+                if frame_age_ms > 800:
+                    log.warning(
+                        "camera %s STALE frame age=%dms (OCR is slower than camera fps; "
+                        "consider OCR_GPU=true / lowering YOLO_IMGSZ)",
+                        cid, frame_age_ms,
+                    )
                 # Save latest frame to disk every 5 frames for visual debugging
                 if frame_n % 5 == 1:
                     try:
@@ -761,6 +860,10 @@ def run_rtsp_loop(
                 if s.PROCESS_INTERVAL_SEC > 0:
                     time.sleep(s.PROCESS_INTERVAL_SEC)
         finally:
+            try:
+                grabber.stop()
+            except Exception:
+                pass
             cap.release()
             log.warning("RTSP capture ended; reconnecting…")
             time.sleep(2.0)
@@ -799,18 +902,28 @@ def run_webcam_loop(
             continue
 
         log.info("Webcam device %d opened for camera %s", device_index, cid)
+        # Same trick as RTSP: dedicated grabber so OCR loop only sees fresh frames.
+        grabber = _LatestFrameBuffer(cap, history=4)
         try:
             frame_n = 0
             last_heartbeat = time.time()
             recent_cam: dict[str, tuple[float, str]] = {}
+            stale_count = 0
+            startup_deadline = time.time() + 8.0
             while True:
                 if stop_event is not None and stop_event.is_set():
                     log.info("Stop requested for camera %s — closing webcam", cid)
                     return
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    log.warning("Webcam %d read failed; reconnecting…", device_index)
-                    break
+                ok, frame, captured_at = grabber.latest_sharpest(max_age_sec=1.5)
+                if not ok or frame is None:
+                    if time.time() > startup_deadline and stale_count > 25:
+                        log.warning("Webcam frames went stale — reconnecting")
+                        break
+                    stale_count += 1
+                    time.sleep(0.05)
+                    continue
+                stale_count = 0
+                frame_age_ms = int((time.time() - captured_at) * 1000)
                 frame_n += 1
                 now = time.time()
                 if now - last_heartbeat >= 30.0:
@@ -834,7 +947,7 @@ def run_webcam_loop(
                 plates = _plate_fut.result()
                 route: str | None = None
                 try:
-                    route = _route_fut.result(timeout=10)
+                    route = _route_fut.result(timeout=1.5)
                 except Exception as _re:
                     log.debug("route OCR timeout/error: %s", _re)
                 ocr_ms = int((time.time() - t_ocr) * 1000)
@@ -842,10 +955,15 @@ def run_webcam_loop(
 
                 if frame_n % 10 == 0:
                     log.info(
-                        "camera %s webcam frame#%d ocr=%dms plates=%s route=%s",
-                        cid, frame_n, ocr_ms,
+                        "camera %s webcam frame#%d age=%dms ocr=%dms plates=%s route=%s",
+                        cid, frame_n, frame_age_ms, ocr_ms,
                         [p for p, _ in plates] if plates else "none",
                         route or "none",
+                    )
+                if frame_age_ms > 800:
+                    log.warning(
+                        "camera %s STALE webcam frame age=%dms — OCR is slower than fps",
+                        cid, frame_age_ms,
                     )
                 if plates or frame_n % 30 == 0:
                     _post_live_debug(
@@ -890,6 +1008,10 @@ def run_webcam_loop(
                 if s.PROCESS_INTERVAL_SEC > 0:
                     time.sleep(s.PROCESS_INTERVAL_SEC)
         finally:
+            try:
+                grabber.stop()
+            except Exception:
+                pass
             cap.release()
             log.warning("Webcam capture ended for device %d; reconnecting…", device_index)
             time.sleep(2.0)
