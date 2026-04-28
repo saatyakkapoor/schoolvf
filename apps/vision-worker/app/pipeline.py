@@ -53,6 +53,12 @@ def _sharpen_roi(roi: "np.ndarray", strength: float = 1.5) -> "np.ndarray":
     return cv2.addWeighted(roi, 1.0 + strength, blur, -strength, 0)
 
 
+_ROUTE_OCR_MIN_CONF: float = 0.50
+"""Minimum RapidOCR confidence for a route candidate to even be considered.
+Below this we get spurious hits like 'AR-02' / 'AR-06' / 'AR-51' from
+random bus body text. The user wants nothing under 50% to surface."""
+
+
 def _ocr_scan_for_route(
     ocr_result: list, label: str, *, allow_bare_number: bool = False
 ) -> tuple[str | None, float]:
@@ -60,14 +66,29 @@ def _ocr_scan_for_route(
     Search one RapidOCR result list for any AR-XX / LED pattern.
     allow_bare_number=True: also accept a lone 1-2 digit number (yellow_mask crop only,
     where spatial context guarantees we're looking at the placard area).
-    Returns (route_str, largest_bbox_area) so callers can pick the biggest match.
+    Returns (route_str, score) where score = bbox_area * ocr_conf so larger
+    *and* more confident reads win. Sub-_ROUTE_OCR_MIN_CONF reads are
+    rejected outright — the user does not want low-confidence noise.
     """
     best: str | None = None
-    best_area: float = 0.0
+    best_score: float = 0.0
     for line in ocr_result:
         if len(line) < 2:
             continue
         raw = str(line[1]).strip().upper()
+        # RapidOCR returns (bbox, text, conf); EasyOCR returns (bbox, text, conf).
+        ocr_conf = 0.0
+        if len(line) >= 3:
+            try:
+                ocr_conf = float(line[2])
+            except (TypeError, ValueError):
+                ocr_conf = 0.0
+        if ocr_conf and ocr_conf < _ROUTE_OCR_MIN_CONF:
+            log.debug(
+                "route OCR [%s] reject low conf raw='%s' conf=%.2f < %.2f",
+                label, raw, ocr_conf, _ROUTE_OCR_MIN_CONF,
+            )
+            continue
         m = (_PLACARD_RE.search(raw)
              or _LED_RE.search(raw)
              or _PLACARD_LOOSE_RE.search(raw))
@@ -88,11 +109,15 @@ def _ocr_scan_for_route(
                 area = (max(xs) - min(xs)) * (max(ys) - min(ys))
             except Exception:
                 area = 1.0
-        log.debug("route OCR [%s] raw='%s' → %s area=%.0f", label, raw, route_str, area)
-        if area > best_area:
-            best_area = area
+        score = area * max(ocr_conf, 0.5)
+        log.info(
+            "route OCR [%s] raw='%s' → %s conf=%.2f area=%.0f score=%.0f",
+            label, raw, route_str, ocr_conf, area, score,
+        )
+        if score > best_score:
+            best_score = score
             best = route_str
-    return best, best_area
+    return best, best_score
 
 
 def _read_route_number(frame: "np.ndarray") -> str | None:
@@ -327,9 +352,14 @@ _ocr_pool: ThreadPoolExecutor | None = None
 
 
 def _get_ocr_pool() -> ThreadPoolExecutor:
+    """Persistent OCR worker pool. Sized for the double-buffered pipeline:
+    each cycle uses 2 slots (plate + route OCR), and we keep up to 2 cycles
+    in flight (current consuming results, next prefetched). 6 leaves headroom
+    for an edge case where the current cycle is still finishing as the next
+    one starts."""
     global _ocr_pool
     if _ocr_pool is None:
-        _ocr_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ocr")
+        _ocr_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="ocr")
     return _ocr_pool
 
 
@@ -706,56 +736,90 @@ def run_rtsp_loop(
             recent_cam: dict[str, tuple[float, str]] = {}  # per-camera cooldown tracker
             startup_deadline = time.time() + 8.0
             stale_count = 0
+
+            # ── Prefetch / double-buffered OCR pipeline ──────────────────────
+            # While we post / jpeg-encode the *current* frame's results, the
+            # *next* frame's plate-OCR + route-OCR is already running on the
+            # GPU. This is what keeps the T1000 saturated; without it the GPU
+            # sits idle for ~150 ms per cycle (HTTP post + snapshot encode).
+            # `pending` holds the OCR work submitted for an upcoming frame.
+            pending: dict | None = None
+            strict_indian = s.PLATE_FILTER.strip().lower() == "indian"
+            _pool = _get_ocr_pool()
+
+            def _submit_frame(_f, _captured_at: float) -> dict:
+                """Kick off plate + route OCR for one frame, return the futures."""
+                _f_copy = _f.copy()
+                t0 = time.time()
+                return {
+                    "frame": _f,
+                    "frame_copy": _f_copy,
+                    "captured_at": _captured_at,
+                    "submitted_at": t0,
+                    "plate_fut": _pool.submit(
+                        read_plates_from_frame,
+                        _f,
+                        min_confidence=s.MIN_CONFIDENCE,
+                        strict_indian=strict_indian,
+                        detection_mode=s.PLATE_DETECTION_MODE.strip().lower(),
+                        vision_stack=s.VISION_STACK,
+                    ),
+                    "route_fut": _pool.submit(_read_route_number, _f_copy),
+                }
+
             while True:
                 if stop_event is not None and stop_event.is_set():
                     log.info("Stop requested for camera %s — closing capture", cid)
                     return
-                # Pull the sharpest of the latest frames *currently* in memory.
-                # Anything older than 1.5s is rejected so we never OCR stale footage.
-                ok, frame, captured_at = grabber.latest_sharpest(max_age_sec=1.5)
-                if not ok or frame is None:
-                    if time.time() > startup_deadline and stale_count > 25:
-                        log.warning("Frames went stale (>1.5s old) — reconnecting RTSP")
-                        break
-                    stale_count += 1
-                    time.sleep(0.05)
-                    continue
-                stale_count = 0
+
+                # Step 1: make sure we have an OCR job in flight for the
+                # current sharpest frame. If `pending` is None it means we
+                # just consumed the previous result; submit a fresh one.
+                if pending is None:
+                    ok, frame, captured_at = grabber.latest_sharpest(max_age_sec=1.5)
+                    if not ok or frame is None:
+                        if time.time() > startup_deadline and stale_count > 25:
+                            log.warning("Frames went stale (>1.5s old) — reconnecting RTSP")
+                            break
+                        stale_count += 1
+                        time.sleep(0.02)
+                        continue
+                    stale_count = 0
+                    pending = _submit_frame(frame, captured_at)
+
+                # Step 2: wait for the in-flight plate OCR to finish.
+                current = pending
+                pending = None  # we're consuming it now
+                frame = current["frame"]
+                frame_copy = current["frame_copy"]
+                captured_at = current["captured_at"]
+                t_ocr = current["submitted_at"]
+                _plate_fut = current["plate_fut"]
+                _route_fut = current["route_fut"]
+
+                plates = _plate_fut.result()
+
+                # Step 3: AS SOON AS plate-OCR is done, prefetch the next
+                # sharpest frame and submit its OCR. This means the GPU keeps
+                # working while we (a) wait for route OCR, (b) jpeg-encode
+                # the snapshot, (c) HTTP-post the detection.
+                ok_n, frame_n2, captured_at_n = grabber.latest_sharpest(max_age_sec=1.5)
+                if ok_n and frame_n2 is not None:
+                    pending = _submit_frame(frame_n2, captured_at_n)
+
                 frame_age_ms = int((time.time() - captured_at) * 1000)
                 frame_n += 1
 
-                # Heartbeat every 30s so we know the thread is alive even with slow OCR
                 now = time.time()
                 if now - last_heartbeat >= 30.0:
                     last_heartbeat = now
                     log.info("camera %s alive — frame #%d", cid, frame_n)
 
-                strict_indian = s.PLATE_FILTER.strip().lower() == "indian"
-
-                # ── Simultaneous CPU + GPU OCR ────────────────────────────────
-                # Plate OCR  → GPU (EasyOCR/YOLO when OCR_GPU=True, else CPU)
-                # Route OCR  → CPU (RapidOCR ONNX), always runs in a worker thread
-                # Both submitted to the persistent OCR pool — no per-frame thread spawning.
-                frame_copy = frame.copy()
-                t_ocr = time.time()
-                _pool = _get_ocr_pool()
-                _plate_fut = _pool.submit(
-                    read_plates_from_frame,
-                    frame,
-                    min_confidence=s.MIN_CONFIDENCE,
-                    strict_indian=strict_indian,
-                    detection_mode=s.PLATE_DETECTION_MODE.strip().lower(),
-                    vision_stack=s.VISION_STACK,
-                )
-                _route_fut = _pool.submit(_read_route_number, frame_copy)
-                plates = _plate_fut.result()
                 route: str | None = None
                 try:
-                    # Tight timeout: route OCR runs in parallel with plate OCR
-                    # but should never extend the cycle by more than 1.5s. If
-                    # it's slower than that we'd rather skip the route number
-                    # for this frame than fall behind real-time.
-                    route = _route_fut.result(timeout=1.5)
+                    # Tight timeout: route OCR is already running in parallel.
+                    # If it's slower than 1s we skip the route for this frame.
+                    route = _route_fut.result(timeout=1.0)
                 except Exception as _re:
                     log.debug("route OCR timeout/error: %s", _re)
                 ocr_ms = int((time.time() - t_ocr) * 1000)
@@ -777,16 +841,20 @@ def run_rtsp_loop(
                         "consider OCR_GPU=true / lowering YOLO_IMGSZ)",
                         cid, frame_age_ms,
                     )
-                # Save latest frame to disk every 5 frames for visual debugging
-                if frame_n % 5 == 1:
+                # Save latest frame to disk every 30 frames for visual debugging.
+                # Was every 5 — turned out to be a 50-100 ms blocking write that
+                # held up the loop on slower disks. 30 keeps the debug image
+                # fresh-ish without starving the OCR cycle.
+                if frame_n % 30 == 1:
                     try:
                         cv2.imwrite(f"/tmp/debug_frame_{cid}.jpg", frame)
                     except Exception:
                         pass
 
-                # Push frame snapshot to debug panel every 5 frames (so user can see what camera sees)
-                # Also push whenever plates found
-                if plates or frame_n % 5 == 1:
+                # Push frame snapshot to debug panel every ~1 s (was every 5
+                # frames ≈ every 150 ms — wasteful when nothing's happening).
+                # Always push when we have plates or a route hit.
+                if plates or route or frame_n % 30 == 1:
                     snap_b64 = frame_to_jpeg_b64(frame, 320)  # small thumbnail for debug panel
                     _post_live_debug(
                         s,
@@ -807,7 +875,17 @@ def run_rtsp_loop(
 
                 snap: str | None = None
                 posted_any = False
+                # Confidence floor: anything below this is treated as noise and
+                # never posted to the dashboard. The user's hard rule:
+                # "atleast 50% confidence for anything to show up on the log".
+                INGEST_CONF_FLOOR = float(s.INGEST_MIN_CONFIDENCE)
                 for plate, conf in plates:
+                    if conf < INGEST_CONF_FLOOR:
+                        log.info(
+                            "plate suppress: %s conf=%.2f < %.2f (INGEST_MIN_CONFIDENCE)",
+                            plate, conf, INGEST_CONF_FLOOR,
+                        )
+                        continue
                     if not _dedupe_allow(plate, last, s.DEDUPE_SECONDS, route):
                         log.debug("plate dedupe skip: %s", plate)
                         continue
@@ -888,44 +966,71 @@ def run_webcam_loop(
             recent_cam: dict[str, tuple[float, str]] = {}
             stale_count = 0
             startup_deadline = time.time() + 8.0
+            strict_indian = s.PLATE_FILTER.strip().lower() == "indian"
+            _pool = _get_ocr_pool()
+            pending: dict | None = None
+
+            def _submit_frame_wc(_f, _captured_at: float) -> dict:
+                t0 = time.time()
+                _f_copy = _f.copy()
+                return {
+                    "frame": _f,
+                    "frame_copy": _f_copy,
+                    "captured_at": _captured_at,
+                    "submitted_at": t0,
+                    "plate_fut": _pool.submit(
+                        read_plates_from_frame,
+                        _f,
+                        min_confidence=s.MIN_CONFIDENCE,
+                        strict_indian=strict_indian,
+                        detection_mode=s.PLATE_DETECTION_MODE.strip().lower(),
+                        vision_stack=s.VISION_STACK,
+                    ),
+                    "route_fut": _pool.submit(_read_route_number, _f_copy),
+                }
+
             while True:
                 if stop_event is not None and stop_event.is_set():
                     log.info("Stop requested for camera %s — closing webcam", cid)
                     return
-                ok, frame, captured_at = grabber.latest_sharpest(max_age_sec=1.5)
-                if not ok or frame is None:
-                    if time.time() > startup_deadline and stale_count > 25:
-                        log.warning("Webcam frames went stale — reconnecting")
-                        break
-                    stale_count += 1
-                    time.sleep(0.05)
-                    continue
-                stale_count = 0
+
+                if pending is None:
+                    ok, frame, captured_at = grabber.latest_sharpest(max_age_sec=1.5)
+                    if not ok or frame is None:
+                        if time.time() > startup_deadline and stale_count > 25:
+                            log.warning("Webcam frames went stale — reconnecting")
+                            break
+                        stale_count += 1
+                        time.sleep(0.02)
+                        continue
+                    stale_count = 0
+                    pending = _submit_frame_wc(frame, captured_at)
+
+                current = pending
+                pending = None
+                frame = current["frame"]
+                frame_copy = current["frame_copy"]
+                captured_at = current["captured_at"]
+                t_ocr = current["submitted_at"]
+                _plate_fut = current["plate_fut"]
+                _route_fut = current["route_fut"]
+
+                plates = _plate_fut.result()
+
+                # Prefetch the next sharpest frame's OCR while we post.
+                ok_n, frame_n2, captured_at_n = grabber.latest_sharpest(max_age_sec=1.5)
+                if ok_n and frame_n2 is not None:
+                    pending = _submit_frame_wc(frame_n2, captured_at_n)
+
                 frame_age_ms = int((time.time() - captured_at) * 1000)
                 frame_n += 1
                 now = time.time()
                 if now - last_heartbeat >= 30.0:
                     last_heartbeat = now
                     log.info("camera %s webcam alive — frame #%d", cid, frame_n)
-                strict_indian = s.PLATE_FILTER.strip().lower() == "indian"
-
-                # ── Simultaneous CPU + GPU OCR (persistent pool) ─────────────
-                frame_copy = frame.copy()
-                t_ocr = time.time()
-                _pool = _get_ocr_pool()
-                _plate_fut = _pool.submit(
-                    read_plates_from_frame,
-                    frame,
-                    min_confidence=s.MIN_CONFIDENCE,
-                    strict_indian=strict_indian,
-                    detection_mode=s.PLATE_DETECTION_MODE.strip().lower(),
-                    vision_stack=s.VISION_STACK,
-                )
-                _route_fut = _pool.submit(_read_route_number, frame_copy)
-                plates = _plate_fut.result()
                 route: str | None = None
                 try:
-                    route = _route_fut.result(timeout=1.5)
+                    route = _route_fut.result(timeout=1.0)
                 except Exception as _re:
                     log.debug("route OCR timeout/error: %s", _re)
                 ocr_ms = int((time.time() - t_ocr) * 1000)
@@ -961,7 +1066,14 @@ def run_webcam_loop(
                     )
                 snap: str | None = None
                 posted_any = False
+                INGEST_CONF_FLOOR = float(s.INGEST_MIN_CONFIDENCE)
                 for plate, conf in plates:
+                    if conf < INGEST_CONF_FLOOR:
+                        log.info(
+                            "plate suppress: %s conf=%.2f < %.2f (INGEST_MIN_CONFIDENCE)",
+                            plate, conf, INGEST_CONF_FLOOR,
+                        )
+                        continue
                     if not _dedupe_allow(plate, last, s.DEDUPE_SECONDS, route):
                         continue
                     if not _camera_cooldown_allow(plate, cid, recent_cam, s.CAMERA_COOLDOWN_SEC):

@@ -1,0 +1,68 @@
+# CUDA-enabled vision worker. Use this when you have an NVIDIA GPU on
+# the host (e.g. T1000 / RTX series) and nvidia-container-toolkit
+# installed. On CPU-only hosts use Dockerfile.vision instead.
+#
+# Build:
+#   docker compose build vision-worker
+#   (compose picks this dockerfile when DOCKERFILE_VISION=Dockerfile.vision.cuda)
+#
+# Verify GPU is visible inside the container:
+#   docker compose run --rm vision-worker python -c \
+#     "import torch; print('cuda=%s name=%s' % (torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'n/a'))"
+
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+
+WORKDIR /app
+
+# Python 3.11 + OpenCV system deps + ffmpeg for RTSP decoding.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        software-properties-common \
+        curl \
+        ca-certificates \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python3.11 \
+        python3.11-dev \
+        python3.11-distutils \
+        python3-pip \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxrender1 \
+        libxext6 \
+        libgomp1 \
+        ffmpeg \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# CUDA-enabled PyTorch. cu121 matches the base image (12.1.1).
+COPY apps/vision-worker/requirements.txt ./requirements.txt
+RUN python -m pip install --upgrade pip wheel \
+    && python -m pip install \
+        torch==2.4.1 torchvision==0.19.1 \
+        --index-url https://download.pytorch.org/whl/cu121 \
+    && python -m pip install -r requirements.txt
+
+COPY packages/__init__.py /app/packages/__init__.py
+COPY packages/shared /app/packages/shared
+RUN rm -rf /app/packages/shared/types
+
+COPY apps/__init__.py /app/apps/__init__.py
+COPY apps/vision-worker /app/apps/vision_worker
+
+ENV PYTHONPATH="/app"
+
+RUN mkdir -p /app/storage/snapshots /app/storage/spool
+
+CMD ["python", "-m", "apps.vision_worker.app.main"]

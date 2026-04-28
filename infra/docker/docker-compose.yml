@@ -105,7 +105,10 @@ services:
     profiles: ["vision"]
     build:
       context: ../../
-      dockerfile: infra/docker/Dockerfile.vision
+      # CPU default. Set DOCKERFILE_VISION=infra/docker/Dockerfile.vision.cuda
+      # in .env to enable CUDA + EasyOCR-on-GPU + FP16 YOLO. Requires
+      # nvidia-container-toolkit on the host.
+      dockerfile: ${DOCKERFILE_VISION:-infra/docker/Dockerfile.vision}
     container_name: schoolvf-vision-worker
     restart: unless-stopped
     environment:
@@ -148,9 +151,12 @@ services:
       OCR_GPU: ${OCR_GPU:-auto}
       YOLO_DEVICE: ${YOLO_DEVICE:-auto}
       YOLO_HALF: ${YOLO_HALF:-auto}
-      # 960 = T1000 sweet spot; bump to 1280 for max recall on distant
-      # plates (~2× GPU work, still real-time on T1000).
-      YOLO_IMGSZ: ${YOLO_IMGSZ:-960}
+      # 1280 = max recall (default on CUDA). 960 = balanced. 640 = CPU-only.
+      YOLO_IMGSZ: ${YOLO_IMGSZ:-1280}
+      # Hard ingest floor: drop any plate read whose combined score is
+      # below this. The user requirement: nothing under 50% reaches the
+      # dashboard. Set 0 to accept everything that passes MIN_CONFIDENCE.
+      INGEST_MIN_CONFIDENCE: ${INGEST_MIN_CONFIDENCE:-0.50}
       # Restrict ingest to these state codes; '*' keeps all 36 Indian states.
       # Recognition still corrects HR↔HE / DL↔OL etc. — the filter only
       # decides whether the corrected plate is forwarded to the API.
@@ -170,6 +176,11 @@ services:
       TORCH_NUM_THREADS: ${TORCH_NUM_THREADS:-16}
       OPENCV_NUM_THREADS: ${OPENCV_NUM_THREADS:-16}
       LIVE_SNAPSHOT_JPEG_QUALITY: ${LIVE_SNAPSHOT_JPEG_QUALITY:-75}
+      # CUDA visibility — mirrors the host's NVIDIA_VISIBLE_DEVICES selection
+      # so PyTorch / EasyOCR see the GPU. With NVIDIA_VISIBLE_DEVICES=all,
+      # nvidia-container-toolkit injects /dev/nvidia* and the driver libs.
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility,video}
     volumes:
       - ../../storage:/app/storage
     depends_on:
@@ -179,6 +190,18 @@ services:
         condition: service_started
     networks:
       - schoolvf
+    # GPU passthrough. Requires nvidia-container-toolkit on the host:
+    #   sudo apt install nvidia-container-toolkit
+    #   sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
+    # If you're on CPU-only, leave the block alone — Docker will simply
+    # ignore it when the nvidia runtime isn't installed (no error).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: ["gpu"]
 
   dashboard:
     build:

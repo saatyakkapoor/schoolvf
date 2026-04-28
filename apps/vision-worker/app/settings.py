@@ -62,10 +62,12 @@ os.environ["YOLO_HALF"] = "1" if _DEFAULT_YOLO_HALF else "0"
 os.environ["OCR_GPU"] = "1" if _DEFAULT_OCR_GPU else "0"
 
 # Push GPU harder when we actually have a GPU. The T1000 (4 GB, 768 CUDA
-# cores) saturates nicely at 960×960 and still hits 40-50 fps. Bump to
-# 1280 with `YOLO_IMGSZ=1280` for max recall on distant plates.
+# cores) handles 1280×1280 in ~25 ms — well under one frame at 30 fps.
+# 1280 finds plates that are only 12-15 px tall in a 1080p frame, which
+# is roughly the size of a school-bus plate at ~30 m. If you don't need
+# that range, set YOLO_IMGSZ=960 in .env to halve the GPU load.
 if _DEFAULT_YOLO_DEVICE.startswith("cuda"):
-    os.environ.setdefault("YOLO_IMGSZ", "960")
+    os.environ.setdefault("YOLO_IMGSZ", "1280")
     # cuDNN autotune picks the fastest convolution algorithm for the input
     # size on first call — ~10-15% faster YOLO from frame 2 onwards.
     try:
@@ -117,10 +119,10 @@ class VisionSettings(BaseSettings):
     """YOLO inference device. Auto: cuda:0 if CUDA detected, else cpu. Override with YOLO_DEVICE env."""
     YOLO_HALF: bool = _DEFAULT_YOLO_HALF
     """FP16 inference for YOLO on CUDA — halves VRAM, ~2× faster on T1000+. Auto-on for CUDA."""
-    YOLO_IMGSZ: int = 960
-    """Image size for YOLO inference. 640 = fastest on CPU; 960 = T1000 sweet
-    spot (best accuracy/throughput); 1280 = maximum recall on distant plates
-    at the cost of ~2× compute. Auto-set to 960 when CUDA is detected."""
+    YOLO_IMGSZ: int = 1280
+    """Image size for YOLO inference. 640 = fastest on CPU; 960 = balanced;
+    1280 = maximum recall on distant / small plates (default on CUDA).
+    The T1000 runs 1280 in ~25 ms which is well under 33 ms / frame at 30 fps."""
     PLATE_DETECTION_MODE: str = "opencv_roi"
     """Used when VISION_STACK=rapid: opencv_roi | fullframe."""
     PLATE_FILTER: str = "indian"
@@ -136,7 +138,16 @@ class VisionSettings(BaseSettings):
     Prevents the same physical car being logged 3-4 times as OCR misreads it on successive frames."""
     MIN_CONFIDENCE: float = 0.09
     """OCR score floor for ROI crops. Fullframe fallback uses an even lower floor automatically.
-    Lower = more reads (some noise), higher = fewer reads (misses moving-bus plates)."""
+    Lower = more reads (some noise), higher = fewer reads (misses moving-bus plates).
+    Note: this controls *recognition* — what the OCR engine accepts internally. The
+    ingest gate (INGEST_MIN_CONFIDENCE) controls what actually shows up on the
+    dashboard."""
+    INGEST_MIN_CONFIDENCE: float = 0.50
+    """Hard floor for posting a plate to the API / dashboard. Anything below
+    this is treated as noise and dropped silently. The user requirement is
+    that no read under 50% confidence ever surfaces in the live feed —
+    set INGEST_MIN_CONFIDENCE=0 in .env to disable the gate (accept all
+    OCR reads that pass MIN_CONFIDENCE)."""
     SNAPSHOT_MAX_WIDTH: int = 520
     LIVE_DEBUG_PUSH: bool = True
     """POST structured frame summaries to API /live/debug (throttled); disable to reduce noise."""
