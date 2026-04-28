@@ -17,6 +17,38 @@ import cv2
 import httpx
 import numpy as np
 
+from apps.vision_worker.app.draw_overlay import (
+    BoxRecord,
+    make_route_box,
+    render_overlay,
+)
+
+
+def _annotate_frame(
+    frame: "np.ndarray",
+    plate_boxes: list,
+    placard_bbox: tuple | None,
+    route_text: str | None,
+) -> "np.ndarray":
+    """Compose the per-frame overlay (plate boxes + route placard) and burn
+    it onto a copy of `frame`. Used right before snapshot encoding so the
+    image the dashboard receives shows what was detected.
+    """
+    boxes: list = list(plate_boxes or [])
+    if placard_bbox is not None:
+        # placard_bbox = (x1, y1, x2, y2, conf)
+        try:
+            x1, y1, x2, y2, pconf = placard_bbox
+            boxes.append(make_route_box(
+                (x1, y1, x2, y2),
+                text=route_text or "placard",
+                conf=float(pconf) if pconf else None,
+            ))
+        except Exception:
+            pass
+    if not boxes:
+        return frame
+    return render_overlay(frame, boxes)
 from apps.vision_worker.app.plate_engine import (
     frame_to_jpeg_b64,
     mock_demo_snapshot_b64,
@@ -120,14 +152,17 @@ def _ocr_scan_for_route(
     return best, best_score
 
 
-def _read_route_number(frame: "np.ndarray") -> str | None:
+def _read_route_number(frame: "np.ndarray") -> tuple[str | None, "tuple | None"]:
     """
     Route-number reader optimised for yellow AR-XX placards on a moving bus.
 
-    Strategy: ONE fast OCR pass on the yellow placard blob. If that misses,
-    we fall back to a SINGLE wide windshield-band crop. The previous
-    multi-zone scan was running 4 OCR passes per frame and adding 1-2 s
-    of latency for every frame that didn't have a clear placard.
+    Returns (route, placard_bbox) where:
+      route        : "AR-07" or None
+      placard_bbox : (x1,y1,x2,y2,conf) of the yellow blob we OCR'd, or
+                     None if the colour mask found no candidate. The pipeline
+                     uses this to draw a yellow box on the snapshot so the
+                     user can SEE the placard region we picked, even when the
+                     OCR couldn't read it.
     """
     try:
         from apps.vision_worker.app.plate_engine import _get_ocr
@@ -136,6 +171,7 @@ def _read_route_number(frame: "np.ndarray") -> str | None:
 
         best_route: str | None = None
         best_area: float = 0.0
+        placard_bbox: tuple | None = None
 
         # ------------------------------------------------------------------ #
         # Pass 1: yellow colour mask → placard blob → OCR                    #
@@ -202,6 +238,17 @@ def _read_route_number(frame: "np.ndarray") -> str | None:
                     texts = [(str(l[1]).strip(), round(float(l[2]), 3))
                              for l in result if len(l) >= 3]
                     log.info("route yellow_mask OCR: match=%s texts=%s", r, texts[:10])
+                # Stash the placard geometry so the pipeline can draw a
+                # yellow box on the snapshot regardless of OCR outcome —
+                # even if we couldn't read the digits, seeing the rectangle
+                # confirms the colour mask is finding the right blob.
+                placard_conf = 0.0
+                if result:
+                    try:
+                        placard_conf = max(float(l[2]) for l in result if len(l) >= 3)
+                    except ValueError:
+                        placard_conf = 0.0
+                placard_bbox = (x1, y1, x2, y2, placard_conf)
 
         # ------------------------------------------------------------------ #
         # Pass 2: ONE windshield-band crop (only if yellow mask missed)      #
@@ -223,10 +270,10 @@ def _read_route_number(frame: "np.ndarray") -> str | None:
 
         if best_route:
             log.info("route OCR winner: %s  area=%.0f", best_route, best_area)
-        return best_route
+        return best_route, placard_bbox
     except Exception as exc:
         log.warning("route OCR exception: %s", exc)
-    return None
+    return None, None
 
 log = logging.getLogger("vision.pipeline")
 
@@ -797,7 +844,7 @@ def run_rtsp_loop(
                 _plate_fut = current["plate_fut"]
                 _route_fut = current["route_fut"]
 
-                plates = _plate_fut.result()
+                plates, plate_boxes = _plate_fut.result()
 
                 # Step 3: AS SOON AS plate-OCR is done, prefetch the next
                 # sharpest frame and submit its OCR. This means the GPU keeps
@@ -816,10 +863,11 @@ def run_rtsp_loop(
                     log.info("camera %s alive — frame #%d", cid, frame_n)
 
                 route: str | None = None
+                placard_bbox = None
                 try:
                     # Tight timeout: route OCR is already running in parallel.
                     # If it's slower than 1s we skip the route for this frame.
-                    route = _route_fut.result(timeout=1.0)
+                    route, placard_bbox = _route_fut.result(timeout=1.0)
                 except Exception as _re:
                     log.debug("route OCR timeout/error: %s", _re)
                 ocr_ms = int((time.time() - t_ocr) * 1000)
@@ -851,11 +899,17 @@ def run_rtsp_loop(
                     except Exception:
                         pass
 
+                # Annotate the frame with detection boxes ONCE so every
+                # downstream JPEG (debug snapshot, ingest snapshot) shows
+                # exactly what the worker found. This is the "proof of work"
+                # the user explicitly asked for.
+                annotated = _annotate_frame(frame, plate_boxes, placard_bbox, route)
+
                 # Push frame snapshot to debug panel every ~1 s (was every 5
                 # frames ≈ every 150 ms — wasteful when nothing's happening).
                 # Always push when we have plates or a route hit.
                 if plates or route or frame_n % 30 == 1:
-                    snap_b64 = frame_to_jpeg_b64(frame, 320)  # small thumbnail for debug panel
+                    snap_b64 = frame_to_jpeg_b64(annotated, 320)  # small thumbnail for debug panel
                     _post_live_debug(
                         s,
                         "vision_frame",
@@ -869,6 +923,8 @@ def run_rtsp_loop(
                             "stack": s.VISION_STACK,
                             "route": route,
                             "snapshot_b64": snap_b64,
+                            "n_plate_boxes": len(plate_boxes or []),
+                            "has_placard_box": placard_bbox is not None,
                         },
                         bypass_interval=bool(plates),
                     )
@@ -892,7 +948,7 @@ def run_rtsp_loop(
                     if not _camera_cooldown_allow(plate, cid, recent_cam, s.CAMERA_COOLDOWN_SEC):
                         continue
                     if snap is None:
-                        snap = frame_to_jpeg_b64(frame, s.SNAPSHOT_MAX_WIDTH)
+                        snap = frame_to_jpeg_b64(annotated, s.SNAPSHOT_MAX_WIDTH)
                     _post_detection(
                         s, plate, conf, snap or None,
                         camera_id=cid, camera_name=cname, detected_route=route,
@@ -902,12 +958,15 @@ def run_rtsp_loop(
 
                 # Route-only fallback: bus visible (placard readable) but plate
                 # OCR returned nothing. Post a route-only sighting so the API
-                # can fill the plate from the registry — dashboard renders a
-                # yellow triangle to flag the auto-fill.
+                # can suggest a plate from the registry — dashboard renders
+                # a yellow triangle. The plate text is NOT auto-filled into
+                # the OCR result; the dashboard surfaces it as a separate
+                # "registry suggests" hint so users can tell the difference
+                # between a real read and a registry-only match.
                 if not posted_any and route:
                     if _route_only_dedupe_allow(route, cid, last, max(s.DEDUPE_SECONDS, 6.0)):
                         if snap is None:
-                            snap = frame_to_jpeg_b64(frame, s.SNAPSHOT_MAX_WIDTH)
+                            snap = frame_to_jpeg_b64(annotated, s.SNAPSHOT_MAX_WIDTH)
                         _post_detection(
                             s, None, 0.0, snap or None,
                             camera_id=cid, camera_name=cname, detected_route=route,
@@ -1015,7 +1074,7 @@ def run_webcam_loop(
                 _plate_fut = current["plate_fut"]
                 _route_fut = current["route_fut"]
 
-                plates = _plate_fut.result()
+                plates, plate_boxes = _plate_fut.result()
 
                 # Prefetch the next sharpest frame's OCR while we post.
                 ok_n, frame_n2, captured_at_n = grabber.latest_sharpest(max_age_sec=1.5)
@@ -1029,8 +1088,9 @@ def run_webcam_loop(
                     last_heartbeat = now
                     log.info("camera %s webcam alive — frame #%d", cid, frame_n)
                 route: str | None = None
+                placard_bbox = None
                 try:
-                    route = _route_fut.result(timeout=1.0)
+                    route, placard_bbox = _route_fut.result(timeout=1.0)
                 except Exception as _re:
                     log.debug("route OCR timeout/error: %s", _re)
                 ocr_ms = int((time.time() - t_ocr) * 1000)
@@ -1048,6 +1108,8 @@ def run_webcam_loop(
                         "camera %s STALE webcam frame age=%dms — OCR is slower than fps",
                         cid, frame_age_ms,
                     )
+                annotated = _annotate_frame(frame, plate_boxes, placard_bbox, route)
+
                 if plates or frame_n % 30 == 0:
                     _post_live_debug(
                         s,
@@ -1062,6 +1124,9 @@ def run_webcam_loop(
                             "engine": s.PLATE_ENGINE,
                             "stack": s.VISION_STACK,
                             "route": route,
+                            "snapshot_b64": frame_to_jpeg_b64(annotated, 320),
+                            "n_plate_boxes": len(plate_boxes or []),
+                            "has_placard_box": placard_bbox is not None,
                         },
                     )
                 snap: str | None = None
@@ -1080,7 +1145,7 @@ def run_webcam_loop(
                         continue
                     _camera_cooldown_mark(plate, cid, recent_cam)
                     if snap is None:
-                        snap = frame_to_jpeg_b64(frame, s.SNAPSHOT_MAX_WIDTH)
+                        snap = frame_to_jpeg_b64(annotated, s.SNAPSHOT_MAX_WIDTH)
                     _post_detection(s, plate, conf, snap or None, camera_id=cid, camera_name=cname,
                                     detected_route=route)
                     posted_any = True
@@ -1089,7 +1154,7 @@ def run_webcam_loop(
                 if not posted_any and route:
                     if _route_only_dedupe_allow(route, cid, last, max(s.DEDUPE_SECONDS, 6.0)):
                         if snap is None:
-                            snap = frame_to_jpeg_b64(frame, s.SNAPSHOT_MAX_WIDTH)
+                            snap = frame_to_jpeg_b64(annotated, s.SNAPSHOT_MAX_WIDTH)
                         _post_detection(
                             s, None, 0.0, snap or None,
                             camera_id=cid, camera_name=cname, detected_route=route,

@@ -190,12 +190,18 @@ export interface LiveDetection {
   swap_resolved?: boolean;
   swap_resolved_by?: string | null;
   /**
-   * True when the plate text was filled from the vehicle registry because the
-   * camera saw the route placard but couldn't read the plate. UI shows a
-   * yellow triangle next to the plate when this is set.
+   * True when only the route placard was visible — the camera couldn't OCR
+   * the plate. The registry suggestion (if any) lives in `suggested_plate`.
+   * UI renders a yellow triangle and a "Registry suggests" hint, never
+   * pretends the plate was read.
    */
   plate_from_storage?: boolean;
-  /** Plate was actually read by the camera (not auto-filled from storage). */
+  /**
+   * Registry plate associated with the detected route, surfaced as a HINT
+   * when `plate_text` is empty. Populated by the API on route-only posts.
+   */
+  suggested_plate?: string | null;
+  /** Plate was actually read by the camera. */
   has_plate?: boolean;
   /** Route was actually read from the placard / LED display. */
   has_route?: boolean;

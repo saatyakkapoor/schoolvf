@@ -556,30 +556,40 @@ def _build_detection_row(
     plate_clean = (plate_text or "").strip().upper() or None
     detected_route_norm = _normalize_route_label(detected_route or "") or None
 
+    # Distinguish "OCR actually read this plate" (`plate_clean` set by the
+    # caller) from "we know the route placard, so the registry can SUGGEST
+    # what plate it should be" (`suggested_plate` derived below). The user
+    # explicitly does not want a registry suggestion to masquerade as a real
+    # OCR read — `plate_text` stays empty in that case and the dashboard
+    # surfaces the suggestion in a separate field.
+    suggested_plate: str | None = None
     plate_from_storage = False
     vehicle: AppVehicle | None = None
 
     if plate_clean:
-        # Look up by plate first (path 1 + 2)
+        # Look up by plate first (paths 1 + 2 — real OCR read)
         vehicle = (
             db.query(AppVehicle)
             .filter(AppVehicle.plate_number == plate_clean, AppVehicle.is_active.is_(True))
             .first()
         )
     elif detected_route_norm:
-        # Path 3: plate missing — try to fill from registry by route
+        # Path 3: route placard visible but plate not readable. Look up the
+        # registry to surface a suggestion, but DO NOT promote it into
+        # plate_text — the camera did not actually see those characters.
         vehicle = _find_vehicle_by_route(db, detected_route_norm)
         if vehicle is not None:
-            plate_clean = vehicle.plate_number
-            plate_from_storage = True
+            suggested_plate = vehicle.plate_number
+            plate_from_storage = True  # still set so the dashboard knows this
+                                       # row is "route-only with a suggestion"
 
     registered_route = ((vehicle.route_number or "").strip().upper()) if vehicle else ""
     route_name = (vehicle.route_name or "") if vehicle else ""
     driver_name = (vehicle.driver_name or "") if vehicle else ""
     is_registered = vehicle is not None
 
-    # Mismatch logic (only meaningful when *both* sides are known and the plate
-    # was actually detected, not auto-filled from storage).
+    # Mismatch logic (only meaningful when *both* sides are known and the
+    # plate was actually OCR'd, not just suggested from storage).
     is_mismatch = bool(
         not plate_from_storage
         and detected_route_norm
@@ -592,7 +602,11 @@ def _build_detection_row(
     return {
         "id": event_id,
         "type": "plate",
+        # plate_text now ONLY contains plates the OCR actually read.
+        # Routes-with-suggestion rows leave this empty and put the registry
+        # plate into `suggested_plate` instead.
         "plate_text": plate_clean or "",
+        "suggested_plate": suggested_plate or "",
         "confidence": confidence,
         "camera_id": camera_id,
         "camera_name": camera_name,
@@ -605,7 +619,7 @@ def _build_detection_row(
         "detected_route": detected_route_norm,
         "is_mismatch": is_mismatch,
         "plate_from_storage": plate_from_storage,
-        "has_plate": bool(plate_clean) and not plate_from_storage,
+        "has_plate": bool(plate_clean),
         "has_route": bool(detected_route_norm),
         "source": source,
         "notes": notes,

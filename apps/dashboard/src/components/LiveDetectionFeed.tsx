@@ -285,9 +285,12 @@ function DetectionRow({ row }: { row: LiveDetection }) {
   const isResolved = row.is_mismatch && row.swap_resolved;
   const isManual = row.source === "manual";
   const plateFromStorage = !!row.plate_from_storage;
-  // Partial read: only the route was visible (no plate read AND no storage match)
+  const suggestedPlate = (row.suggested_plate || "").trim();
+  // Route-only: camera saw the placard but couldn't read the plate. We
+  // explicitly DO NOT pretend the registry plate is an OCR read here —
+  // the chip says "no plate read" and `suggestedPlate` (if any) is shown
+  // as a hint underneath, clearly labelled "registry suggests".
   const routeOnly = !row.plate_text && !!row.detected_route;
-  // Plate visible but route missing — fine, just no warning chip
   const [adjustOpen, setAdjustOpen] = useState(false);
 
   const borderColor = isMismatch
@@ -357,26 +360,48 @@ function DetectionRow({ row }: { row: LiveDetection }) {
                   letterSpacing: 1.5,
                   color: isMismatch
                     ? "warning.main"
-                    : plateFromStorage
-                    ? "#FFEB3B"
                     : hasRoute
                     ? "#FFD700"
                     : "text.primary",
-                  textDecoration: plateFromStorage ? "underline dotted" : "none",
                 }}
               >
                 {row.plate_text}
               </Typography>
             ) : (
-              <Tooltip title="Plate not readable — only the route placard was visible" arrow>
-                <Chip
-                  icon={<WarningAmberIcon sx={{ fontSize: "12px !important" }} />}
-                  label="No plate read"
-                  size="small"
-                  variant="outlined"
-                  sx={{ height: 20, fontSize: 11, color: "#FFEB3B", borderColor: "rgba(255,235,59,0.5)" }}
-                />
-              </Tooltip>
+              <Stack direction="column" spacing={0.25}>
+                <Tooltip
+                  title="Camera couldn't read the plate this pass — only the route placard was visible. Plate is NOT auto-filled."
+                  arrow
+                >
+                  <Chip
+                    icon={<WarningAmberIcon sx={{ fontSize: "12px !important" }} />}
+                    label="No plate read"
+                    size="small"
+                    variant="outlined"
+                    sx={{ height: 20, fontSize: 11, color: "#FFEB3B", borderColor: "rgba(255,235,59,0.5)" }}
+                  />
+                </Tooltip>
+                {suggestedPlate && (
+                  <Tooltip
+                    title={`Registry has ${suggestedPlate} mapped to this route. Treat as a hint, not a confirmed read.`}
+                    arrow
+                  >
+                    <Typography
+                      variant="caption"
+                      fontFamily="monospace"
+                      sx={{
+                        opacity: 0.55,
+                        fontStyle: "italic",
+                        letterSpacing: 1.0,
+                        color: "#FFEB3B",
+                        textDecoration: "underline dotted",
+                      }}
+                    >
+                      registry suggests {suggestedPlate}
+                    </Typography>
+                  </Tooltip>
+                )}
+              </Stack>
             )}
             {!routeOnly && row.confidence > 0 && <ConfidenceBadge value={row.confidence} />}
 

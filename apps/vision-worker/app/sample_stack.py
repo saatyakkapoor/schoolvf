@@ -19,6 +19,14 @@ from typing import Any
 import cv2
 import numpy as np
 
+from apps.vision_worker.app.draw_overlay import (
+    BoxRecord,
+    overlay_add_bumper,
+    overlay_add_plate_region,
+    overlay_add_vehicle,
+    overlay_drain,
+    overlay_reset,
+)
 from packages.shared.domain.plate import (
     is_state_allowed,
     is_valid_plate_format,
@@ -501,12 +509,21 @@ def read_plates_sample_stack(
     *,
     min_confidence: float,
     strict_indian: bool,
-) -> list[tuple[str, float]]:
+) -> tuple[list[tuple[str, float]], list[BoxRecord]]:
     """
     1) Plate *detection* (regions) — plate_detection + optional plate YOLO.
     2) Plate *recognition* (EasyOCR) — only if PLATE_STAGE=recognition and quality gate passes.
+
+    Returns (plates, overlay_boxes). The boxes describe the geometry the
+    detector saw (vehicle bbox, bumper crop, plate ROI), with `accepted=True`
+    on plate boxes that yielded a successful OCR read. The pipeline draws
+    these on the snapshot so the dashboard shows what was actually scanned.
     """
     global _last_detection_log_ts
+
+    # Reset the per-thread overlay bag at the very top of the call so we
+    # never leak boxes from a previous frame on the same worker thread.
+    overlay_reset()
 
     from apps.vision_worker.app.settings import get_settings
 
@@ -663,6 +680,14 @@ def read_plates_sample_stack(
                 if bumper_crop.size == 0:
                     continue
                 vw, vh = bumper_crop.shape[1], bumper_crop.shape[0]
+                # Collect overlay geometry so the snapshot can show the user
+                # exactly which region we cropped + scanned.
+                overlay_add_vehicle(
+                    (x1, y1, x2, y2),
+                    conf=float(veh.get("confidence", 0.0)),
+                    label=str(veh.get("class_name") or "veh"),
+                )
+                overlay_add_bumper((x1, bumper_top, x2, y2))
                 log.info(
                     "vehicle %s (%d,%d,%d,%d) conf=%.2f bumper=%dx%d",
                     veh["class_name"], x1, y1, x2, y2, veh["confidence"], vw, vh,
@@ -752,6 +777,12 @@ def read_plates_sample_stack(
                                 py2_ext = min(vh, py2 + ph)
 
                                 plate_rois_found = True
+                                # Absolute coordinates of this plate box in
+                                # the original frame (for overlay rendering).
+                                plate_abs_bbox = (
+                                    x1 + px1_pad, bumper_top + py1_pad,
+                                    x1 + px2_pad, bumper_top + py2_ext,
+                                )
                                 log.info(
                                     "  → plate YOLO box (%d,%d,%d,%d) conf=%.2f ratio=%.2f → tight+2line",
                                     px1, py1, px2, py2, pconf, (ph / max(pw, 1)),
@@ -766,6 +797,7 @@ def read_plates_sample_stack(
                                 # YOLO box's tight crop happens to be readable.
 
                                 # Crop 1: tight (single-line plate winner)
+                                merged_before_tight = dict(merged)
                                 tight = bumper_crop[py1_pad:py2, px1_pad:px2_pad]
                                 if tight.size > 0:
                                     plate_enh = _enhance_vehicle_crop(tight, target_min_width=300)
@@ -794,6 +826,28 @@ def read_plates_sample_stack(
                                             quality=max(0.45, pconf * 0.9),
                                             ocr_min=0.10,
                                         )
+
+                                # Mark the box on the overlay. Accepted (red)
+                                # if either crop produced a new plate read,
+                                # otherwise candidate (orange) so the user can
+                                # see "we found this region but couldn't OCR it".
+                                accepted = (len(merged) > len(merged_before_tight))
+                                # Best plate text we've collected so far for
+                                # this region — pick the longest one which is
+                                # almost certainly the most-complete read.
+                                if accepted:
+                                    new_plates = set(merged) - set(merged_before_tight)
+                                    label = max(new_plates, key=len) if new_plates else None
+                                    label_conf = merged.get(label or "", pconf) if label else pconf
+                                else:
+                                    label = None
+                                    label_conf = pconf
+                                overlay_add_plate_region(
+                                    plate_abs_bbox,
+                                    text=label,
+                                    conf=float(label_conf) if label_conf is not None else None,
+                                    accepted=accepted,
+                                )
                     except Exception as e:
                         log.warning("  → plate YOLO on bumper crop failed: %s", e)
 
@@ -890,4 +944,7 @@ def read_plates_sample_stack(
             _rejected_reads[:8] or "none",
         )
 
-    return [(p, merged[p]) for p in sorted(merged, key=lambda k: (-len(k), -merged[k]))]
+    plates_out = [
+        (p, merged[p]) for p in sorted(merged, key=lambda k: (-len(k), -merged[k]))
+    ]
+    return plates_out, overlay_drain()

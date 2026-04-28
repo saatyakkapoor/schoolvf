@@ -660,7 +660,7 @@ def read_plates_from_frame(
     fullframe_fallback: bool = True,
     max_roi: int = 8,
     vision_stack: str | None = None,
-) -> list[tuple[str, float]]:
+) -> tuple[list[tuple[str, float]], list]:
     """
     Two-step pipeline:
       1. license_plate_detector.pt YOLO  →  each detected bbox gets TWO OCR crops:
@@ -682,6 +682,7 @@ def read_plates_from_frame(
             return _read_plates_sample_stack(frame, min_confidence=min_confidence, strict_indian=strict_indian)
         except Exception as e:
             log.warning("sample stack failed, using rapid: %s", e)
+    # Rapid stack — no overlay support yet, return empty box list.
 
     import os
     from pathlib import Path
@@ -771,7 +772,7 @@ def read_plates_from_frame(
                 strict_indian=strict_indian,
             )
 
-    return [(p, merged[p]) for p in sorted(merged)]
+    return [(p, merged[p]) for p in sorted(merged)], []
 
 
 def _add_fullframe_results(
