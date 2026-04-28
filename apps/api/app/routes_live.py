@@ -173,7 +173,10 @@ _FRAME_HEADER = b"Content-Type: image/jpeg\r\n\r\n"
 # Low-latency preview settings
 _MJPEG_TARGET_FPS = 20
 _MJPEG_MAX_WIDTH = 1280
-_MJPEG_JPEG_QUALITY = 75
+# Bumped 75 -> 88. At 75 the JPEG encoder smudges 3-4 px wide plate
+# strokes which kills downstream OCR debugging; the user explicitly
+# noted "the api -> mjpeg is somehow ruining the quality of the image".
+_MJPEG_JPEG_QUALITY = 88
 # How many frames to grab()-and-discard to drain the RTSP jitter buffer before retrieve().
 # grab() only reads the compressed header — much cheaper than cap.read() which decodes pixels.
 _MJPEG_DRAIN_GRABS = 2

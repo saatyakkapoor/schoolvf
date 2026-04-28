@@ -148,7 +148,11 @@ class VisionSettings(BaseSettings):
     that no read under 50% confidence ever surfaces in the live feed —
     set INGEST_MIN_CONFIDENCE=0 in .env to disable the gate (accept all
     OCR reads that pass MIN_CONFIDENCE)."""
-    SNAPSHOT_MAX_WIDTH: int = 520
+    SNAPSHOT_MAX_WIDTH: int = 960
+    """Max width in px for the dashboard snapshot. 520 was destroying plate
+    legibility — at typical capture distance a plate is ~60 px wide and
+    a 520 px snapshot drops that to ~25 px, illegible. 960 keeps plates
+    around 90-100 px wide which is what the eye needs to read them."""
     LIVE_DEBUG_PUSH: bool = True
     """POST structured frame summaries to API /live/debug (throttled); disable to reduce noise."""
     PLATE_USE_HEURISTIC_BANDS: bool = False

@@ -2,7 +2,7 @@ FROM public.ecr.aws/docker/library/python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies required by OpenCV
+# Install system dependencies required by OpenCV + curl for the plate-model download.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libgl1 \
@@ -11,6 +11,8 @@ RUN apt-get update && \
         libxrender1 \
         libxext6 \
         libgomp1 \
+        curl \
+        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # sample.txt stack: CPU PyTorch first, then ultralytics + easyocr + rest
@@ -28,7 +30,16 @@ RUN rm -rf /app/packages/shared/types
 # Copy vision worker (underscore path for valid Python package name)
 COPY apps/__init__.py /app/apps/__init__.py
 COPY apps/vision-worker /app/apps/vision_worker
-# Optional: plate-only YOLO weights in apps/vision-worker/models/ (not vehicle COCO models)
+
+# Bake the public license-plate YOLO weight into the image so the worker
+# never has to phone home on first start. Same URL the runtime
+# auto-downloader uses; if the download fails the build still succeeds
+# and the runtime will retry on every start until it gets through.
+RUN mkdir -p /app/apps/vision_worker/models && \
+    curl -fsSL --retry 3 --retry-delay 2 \
+      -o /app/apps/vision_worker/models/license_plate_detector.pt \
+      "https://huggingface.co/morsetechlab/yolov11-license-plate-detection/resolve/main/license-plate-finetune-v1n.pt" \
+      || echo "WARN: plate-model download failed at build time — runtime will retry"
 
 # Monorepo root only — never add /app/packages/shared alone (shadows stdlib names).
 ENV PYTHONPATH="/app"

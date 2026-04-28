@@ -61,6 +61,14 @@ RUN rm -rf /app/packages/shared/types
 COPY apps/__init__.py /app/apps/__init__.py
 COPY apps/vision-worker /app/apps/vision_worker
 
+# Bake the public plate YOLO weight (~5 MB) into the image so first-run
+# doesn't depend on internet access from inside the container.
+RUN mkdir -p /app/apps/vision_worker/models && \
+    curl -fsSL --retry 3 --retry-delay 2 \
+      -o /app/apps/vision_worker/models/license_plate_detector.pt \
+      "https://huggingface.co/morsetechlab/yolov11-license-plate-detection/resolve/main/license-plate-finetune-v1n.pt" \
+      || echo "WARN: plate-model download failed at build time — runtime will retry"
+
 ENV PYTHONPATH="/app"
 
 RUN mkdir -p /app/storage/snapshots /app/storage/spool

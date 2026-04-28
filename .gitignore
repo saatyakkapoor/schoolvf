@@ -43,10 +43,13 @@ infra/docker/grafana-data/
 .DS_Store
 Thumbs.db
 
-# Models
+# Models — block heavy weights but keep the small plate detector that
+# the worker needs to function out of the box (and is auto-downloaded
+# at runtime / build time anyway, but still nicer to have it tracked).
 *.pt
 *.onnx
 *.pth
+!apps/vision-worker/models/license_plate_detector.pt
 
 # Logs
 *.log

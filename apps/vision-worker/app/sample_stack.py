@@ -57,13 +57,67 @@ except ImportError:
 _MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 
 
+_PLATE_MODEL_DOWNLOAD_URL = (
+    "https://huggingface.co/morsetechlab/yolov11-license-plate-detection"
+    "/resolve/main/license-plate-finetune-v1n.pt"
+)
+"""Public single-class yolov11n license-plate detector hosted on
+HuggingFace by morsetechlab. ~5.4 MB, single class "License_Plate".
+Downloaded on first start if no local weight is found and baked into
+the Docker image at build time so the container also works offline."""
+
+
+def _try_download_plate_model(target: Path) -> bool:
+    """Best-effort fetch of a public license-plate YOLO weight.
+
+    Returns True if the file is now present on disk, False otherwise.
+    Failure modes (no internet, GitHub release missing, etc.) are
+    swallowed — the rest of the pipeline still works without a plate
+    detector, just less accurately. Logged loudly so the operator
+    notices.
+    """
+    if target.is_file() and target.stat().st_size > 1_000_000:
+        return True
+    target.parent.mkdir(parents=True, exist_ok=True)
+    log.warning(
+        "license_plate_detector.pt not found at %s — downloading from %s",
+        target, _PLATE_MODEL_DOWNLOAD_URL,
+    )
+    try:
+        import urllib.request
+
+        tmp = target.with_suffix(".pt.tmp")
+        with urllib.request.urlopen(_PLATE_MODEL_DOWNLOAD_URL, timeout=30) as resp:
+            data = resp.read()
+        if len(data) < 1_000_000:
+            log.warning("plate model download too small (%d bytes) — discarding", len(data))
+            return False
+        tmp.write_bytes(data)
+        tmp.replace(target)
+        log.warning("Plate model downloaded OK: %s (%d bytes)", target, target.stat().st_size)
+        return True
+    except Exception as exc:
+        log.warning(
+            "Plate model auto-download failed (%s). Place a yolov8 plate weight at %s "
+            "for accurate detection. Falling back to OpenCV contour analysis on the bumper crop.",
+            exc, target,
+        )
+        return False
+
+
 def _plate_model_path() -> Path | None:
     env = (os.environ.get("YOLO_PLATE_MODEL") or "").strip()
     if env:
         p = Path(env)
         return p if p.is_file() else None
     p = _MODELS_DIR / "license_plate_detector.pt"
-    return p if p.is_file() else None
+    if p.is_file():
+        return p
+    # Auto-download if missing. Skipped when YOLO_PLATE_AUTODOWNLOAD=0.
+    if (os.environ.get("YOLO_PLATE_AUTODOWNLOAD", "1") or "1").strip() not in ("0", "false", "no"):
+        if _try_download_plate_model(p):
+            return p
+    return None
 
 
 class UltraAccuratePlateDetector:
@@ -851,16 +905,87 @@ def read_plates_sample_stack(
                     except Exception as e:
                         log.warning("  → plate YOLO on bumper crop failed: %s", e)
 
-                # Method B (only if plate-YOLO found nothing AND budget allows):
-                # one OCR call on the whole enhanced bumper crop. Body-text is
-                # already excluded by the bumper crop, so this is safe.
+                # Method B: OpenCV contour-based plate finder on the bumper.
+                # Used whenever plate-YOLO didn't fire (model missing or no
+                # box passed conf=0.10 inside this bumper). Without this
+                # step, "no plate-YOLO model" silently meant "no plate boxes
+                # at all" and the user never saw a red/orange overlay.
+                if not plate_rois_found and ocr_calls < OCR_BUDGET:
+                    try:
+                        from apps.vision_worker.app.plate_detection import (
+                            collect_plate_region_candidates,
+                        )
+
+                        contour_cands = collect_plate_region_candidates(
+                            bumper_crop, max_candidates=4, use_heuristic_bands=False,
+                        )
+                        log.info("  → contour fallback: %d candidates in bumper",
+                                 len(contour_cands))
+                        # Sort by quality and OCR the top 2 (budget permitting).
+                        contour_cands.sort(
+                            key=lambda d: float(d.get("quality_score") or 0.0),
+                            reverse=True,
+                        )
+                        for cand in contour_cands[:2]:
+                            if ocr_calls >= OCR_BUDGET:
+                                break
+                            cx1, cy1, cx2, cy2 = cand["bbox"]
+                            # Map contour bbox into ABSOLUTE frame coords for the overlay.
+                            abs_box = (x1 + cx1, bumper_top + cy1,
+                                       x1 + cx2, bumper_top + cy2)
+                            roi = cand.get("roi")
+                            if roi is None or roi.size == 0:
+                                continue
+                            plate_rois_found = True  # at least we found regions
+                            merged_before = dict(merged)
+                            roi_enh = _enhance_vehicle_crop(roi, target_min_width=300)
+                            _ocr_and_push(
+                                roi_enh,
+                                source=f"veh_cnt_{cand.get('method', '')[:6]}",
+                                quality=float(cand.get("quality_score", 0.4)),
+                                ocr_min=0.10,
+                            )
+                            accepted = (len(merged) > len(merged_before))
+                            if accepted:
+                                new_p = set(merged) - set(merged_before)
+                                lab = max(new_p, key=len) if new_p else None
+                                lab_conf = merged.get(lab or "", 0.0) if lab else None
+                            else:
+                                lab = None
+                                lab_conf = float(cand.get("quality_score") or 0.0) or None
+                            overlay_add_plate_region(
+                                abs_box, text=lab,
+                                conf=lab_conf,
+                                accepted=accepted,
+                            )
+                    except Exception as e:
+                        log.warning("  → contour fallback failed: %s", e)
+
+                # Method C: still nothing? OCR the whole bumper as one big
+                # crop. This is a hail-mary — the bumper crop excludes
+                # body paint so it's much safer than a full-frame pass.
                 if not plate_rois_found and not merged and ocr_calls < OCR_BUDGET:
                     bumper_enh = _enhance_vehicle_crop(bumper_crop, target_min_width=480)
+                    merged_before = dict(merged)
                     _ocr_and_push(
                         bumper_enh,
                         source="veh_bumper",
                         quality=0.40,
                         ocr_min=0.10,
+                    )
+                    # Mark the bumper crop on the overlay so the user
+                    # can see "we did try OCR on the whole bumper".
+                    bumper_abs_box = (x1, bumper_top, x2, y2)
+                    accepted = (len(merged) > len(merged_before))
+                    if accepted:
+                        new_p = set(merged) - set(merged_before)
+                        lab = max(new_p, key=len) if new_p else None
+                        lab_conf = merged.get(lab or "", 0.0) if lab else None
+                    else:
+                        lab = None
+                        lab_conf = None
+                    overlay_add_plate_region(
+                        bumper_abs_box, text=lab, conf=lab_conf, accepted=accepted,
                     )
 
             if merged:

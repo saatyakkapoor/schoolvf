@@ -925,12 +925,18 @@ def mock_demo_snapshot_b64(plate: str, max_w: int) -> str:
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
 
-def frame_to_jpeg_b64(frame: "NDArray[np.uint8]", max_w: int) -> str:
+def frame_to_jpeg_b64(frame: "NDArray[np.uint8]", max_w: int, *, quality: int = 88) -> str:
+    """Encode `frame` to base64 JPEG. Higher quality + LANCZOS resize so the
+    plate stays legible in the dashboard. Quality 88 is roughly the sweet
+    spot for ALPR-relevant detail at <40 KB per snapshot."""
     h, w = frame.shape[:2]
     if w > max_w:
         scale = max_w / w
-        frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
-    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        frame = cv2.resize(
+            frame, (int(w * scale), int(h * scale)),
+            interpolation=cv2.INTER_LANCZOS4,
+        )
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
     if not ok:
         return ""
     return base64.b64encode(buf.tobytes()).decode("ascii")

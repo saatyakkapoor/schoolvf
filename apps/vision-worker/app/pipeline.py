@@ -908,8 +908,11 @@ def run_rtsp_loop(
                 # Push frame snapshot to debug panel every ~1 s (was every 5
                 # frames ≈ every 150 ms — wasteful when nothing's happening).
                 # Always push when we have plates or a route hit.
+                # Use a 720 px tile so the user can actually READ the plate
+                # and verify the overlay boxes; the debug panel shrinks it
+                # in CSS but the underlying pixels stay sharp.
                 if plates or route or frame_n % 30 == 1:
-                    snap_b64 = frame_to_jpeg_b64(annotated, 320)  # small thumbnail for debug panel
+                    snap_b64 = frame_to_jpeg_b64(annotated, 720)
                     _post_live_debug(
                         s,
                         "vision_frame",
@@ -1124,7 +1127,7 @@ def run_webcam_loop(
                             "engine": s.PLATE_ENGINE,
                             "stack": s.VISION_STACK,
                             "route": route,
-                            "snapshot_b64": frame_to_jpeg_b64(annotated, 320),
+                            "snapshot_b64": frame_to_jpeg_b64(annotated, 720),
                             "n_plate_boxes": len(plate_boxes or []),
                             "has_placard_box": placard_bbox is not None,
                         },
