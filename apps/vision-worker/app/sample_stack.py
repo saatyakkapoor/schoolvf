@@ -584,6 +584,10 @@ def read_plates_sample_stack(
     s = get_settings()
     stage = (s.PLATE_STAGE or "recognition").strip().lower()
     q_ocr_min = float(s.PLATE_DETECT_MIN_QUALITY_FOR_OCR)
+    # Upscale plate crops aggressively — default 720 px min width uses more
+    # GPU but reads clear plates far more reliably than 300 px.
+    ocr_target_w = max(480, int(getattr(s, "PLATE_OCR_TARGET_MIN_WIDTH", 720)))
+    ocr_bumper_w = max(ocr_target_w, 560)
 
     det = get_detector()
 
@@ -854,7 +858,9 @@ def read_plates_sample_stack(
                                 merged_before_tight = dict(merged)
                                 tight = bumper_crop[py1_pad:py2, px1_pad:px2_pad]
                                 if tight.size > 0:
-                                    plate_enh = _enhance_vehicle_crop(tight, target_min_width=300)
+                                    plate_enh = _enhance_vehicle_crop(
+                                        tight, target_min_width=ocr_target_w
+                                    )
                                     _ocr_and_push(
                                         plate_enh,
                                         source="veh_plate",
@@ -873,7 +879,9 @@ def read_plates_sample_stack(
                                 ):
                                     ext = bumper_crop[py1_pad:py2_ext, px1_pad:px2_pad]
                                     if ext.size > 0:
-                                        ext_enh = _enhance_vehicle_crop(ext, target_min_width=300)
+                                        ext_enh = _enhance_vehicle_crop(
+                                            ext, target_min_width=ocr_target_w
+                                        )
                                         _ocr_and_push(
                                             ext_enh,
                                             source="veh_plate_2line",
@@ -938,7 +946,9 @@ def read_plates_sample_stack(
                                 continue
                             plate_rois_found = True  # at least we found regions
                             merged_before = dict(merged)
-                            roi_enh = _enhance_vehicle_crop(roi, target_min_width=300)
+                            roi_enh = _enhance_vehicle_crop(
+                                roi, target_min_width=ocr_target_w
+                            )
                             _ocr_and_push(
                                 roi_enh,
                                 source=f"veh_cnt_{cand.get('method', '')[:6]}",
@@ -965,7 +975,9 @@ def read_plates_sample_stack(
                 # crop. This is a hail-mary — the bumper crop excludes
                 # body paint so it's much safer than a full-frame pass.
                 if not plate_rois_found and not merged and ocr_calls < OCR_BUDGET:
-                    bumper_enh = _enhance_vehicle_crop(bumper_crop, target_min_width=480)
+                    bumper_enh = _enhance_vehicle_crop(
+                        bumper_crop, target_min_width=ocr_bumper_w
+                    )
                     merged_before = dict(merged)
                     _ocr_and_push(
                         bumper_enh,

@@ -91,6 +91,42 @@ Below this we get spurious hits like 'AR-02' / 'AR-06' / 'AR-51' from
 random bus body text. The user wants nothing under 50% to surface."""
 
 
+def _union_vehicle_bbox(
+    boxes: list[tuple[int, int, int, int]],
+    fh: int,
+    fw: int,
+) -> tuple[int, int, int, int]:
+    """Axis-aligned union of all vehicle boxes plus a small margin."""
+    x1 = min(b[0] for b in boxes)
+    y1 = min(b[1] for b in boxes)
+    x2 = max(b[2] for b in boxes)
+    y2 = max(b[3] for b in boxes)
+    pad = max(8, int(0.02 * max(x2 - x1, y2 - y1)))
+    return (
+        max(0, x1 - pad),
+        max(0, y1 - pad),
+        min(fw, x2 + pad),
+        min(fh, y2 + pad),
+    )
+
+
+def _vehicle_boxes_for_route(frame: "np.ndarray") -> list[tuple[int, int, int, int]]:
+    """One lightweight vehicle-YOLO pass so route OCR knows where the bus is.
+
+    This duplicates the vehicle detection that also runs inside the plate
+    stack, but that path is on another thread — we need bboxes *before*
+    submitting route OCR. Cost is one extra YOLO forward per frame; on a
+    T1000 it is the right trade for spatially correct placard reading."""
+    try:
+        from apps.vision_worker.app.plate_detection import get_vehicle_detector
+
+        vehs = get_vehicle_detector().detect(frame)
+        return [tuple(int(x) for x in v["bbox"]) for v in vehs[:6]]
+    except Exception as exc:
+        log.debug("vehicle pre-pass for route failed: %s", exc)
+        return []
+
+
 def _ocr_scan_for_route(
     ocr_result: list, label: str, *, allow_bare_number: bool = False
 ) -> tuple[str | None, float]:
@@ -152,70 +188,92 @@ def _ocr_scan_for_route(
     return best, best_score
 
 
-def _read_route_number(frame: "np.ndarray") -> tuple[str | None, "tuple | None"]:
+def _read_route_number(
+    frame: "np.ndarray",
+    vehicle_bboxes: list[tuple[int, int, int, int]] | None = None,
+) -> tuple[str | None, "tuple | None"]:
     """
-    Route-number reader optimised for yellow AR-XX placards on a moving bus.
+    Route reader for yellow AR-XX placards / LED strip — **only inside vehicle
+    detections**. Searching the full frame was picking up random yellow signs,
+    road paint, and buildings; the user reported bogus routes from "somewhere
+    random".
 
-    Returns (route, placard_bbox) where:
-      route        : "AR-07" or None
-      placard_bbox : (x1,y1,x2,y2,conf) of the yellow blob we OCR'd, or
-                     None if the colour mask found no candidate. The pipeline
-                     uses this to draw a yellow box on the snapshot so the
-                     user can SEE the placard region we picked, even when the
-                     OCR couldn't read it.
+    Parameters
+    ----------
+    vehicle_bboxes
+        Pixel bboxes ``(x1,y1,x2,y2)`` from the same-frame vehicle YOLO pass.
+        If empty / None, route OCR is skipped entirely (no bus → no route).
+
+    Returns (route, placard_bbox) — placard_bbox is frame coords for overlay.
     """
     try:
+        if not vehicle_bboxes:
+            log.debug(
+                "route OCR skipped — no vehicle boxes (placard search is bus-only)",
+            )
+            return None, None
+
         from apps.vision_worker.app.plate_engine import _get_ocr
-        ocr = _get_ocr()  # RapidOCR — CPU ONNX, thread-safe
+
+        ocr = _get_ocr()
         h, w = frame.shape[:2]
+
+        ux1, uy1, ux2, uy2 = _union_vehicle_bbox(vehicle_bboxes, h, w)
+        union_area = max(1, (ux2 - ux1) * (uy2 - uy1))
+
+        # Binary mask: yellow placard must lie ON the detected bus(es).
+        bus_mask = np.zeros((h, w), dtype=np.uint8)
+        for bx1, by1, bx2, by2 in vehicle_bboxes:
+            bx1, by1 = max(0, bx1), max(0, by1)
+            bx2, by2 = min(w - 1, bx2), min(h - 1, by2)
+            if bx2 > bx1 and by2 > by1:
+                cv2.rectangle(bus_mask, (bx1, by1), (bx2, by2), 255, -1)
+        dil_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+        bus_mask = cv2.dilate(bus_mask, dil_k)
 
         best_route: str | None = None
         best_area: float = 0.0
         placard_bbox: tuple | None = None
 
         # ------------------------------------------------------------------ #
-        # Pass 1: yellow colour mask → placard blob → OCR                    #
+        # Pass 1: yellow mask RESTRICTED to bus_mask                         #
         # ------------------------------------------------------------------ #
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         yellow_mask = cv2.inRange(hsv, _YELLOW_HSV_LO, _YELLOW_HSV_HI)
-
-        # Close small gaps (plate lettering breaks the mask), remove tiny speckles
         k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 6))
-        k_open  = cv2.getStructuringElement(cv2.MORPH_RECT, (5,  3))
+        k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
         yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_CLOSE, k_close)
-        yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_OPEN,  k_open)
+        yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_OPEN, k_open)
+        yellow_mask = cv2.bitwise_and(yellow_mask, bus_mask)
 
         contours, _ = cv2.findContours(yellow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
             best_cnt: tuple[int, int, int, int] | None = None
             best_cnt_score = 0.0
-            frame_area = h * w
             for cnt in contours:
                 cx, cy_box, cw, ch = cv2.boundingRect(cnt)
                 area = cw * ch
                 ar = cw / max(ch, 1)
-                # Must be placard-sized: between 0.05% and 8% of frame area.
-                # The bus BODY is yellow but fills >20% of frame — exclude it.
-                # The placard is a small card inside the windshield.
-                area_frac = area / frame_area
-                if area_frac < 0.0005 or area_frac > 0.08:
+                # Size relative to the *bus union*, not the whole frame — fixes
+                # tiny frame-fraction thresholds when the bus is small/distant.
+                area_frac = area / union_area
+                if area_frac < 0.0008 or area_frac > 0.45:
                     continue
-                if ar < 1.2 or ar > 10.0:
+                if ar < 1.2 or ar > 12.0:
                     continue
-                # Skip OSD strips and bottom of frame (plate zone — not where placard is)
-                centre_y = cy_box + ch / 2
-                if centre_y < h * 0.08 or centre_y > h * 0.75:
+                centre_y = cy_box + ch / 2.0
+                # Upper ~70 % of the bus box = windshield / LED, not bumper plate
+                rel_y = (centre_y - uy1) / max(uy2 - uy1, 1)
+                if rel_y < 0.04 or rel_y > 0.72:
                     continue
-                # Score: prefer larger area (up to the 8% cap) and placard aspect ratio
                 aspect_score = 1.0 - min(abs(ar - 3.5) / 3.5, 1.0)
-                score = area_frac * 10 + aspect_score
+                score = area_frac * 8.0 + aspect_score
                 if score > best_cnt_score:
                     best_cnt_score = score
                     best_cnt = (cx, cy_box, cw, ch)
 
             if best_cnt is not None:
                 bx, by, bw, bh = best_cnt
-                # Add generous padding so letters at the edge aren't clipped
                 pad_x = max(6, int(bw * 0.10))
                 pad_y = max(4, int(bh * 0.20))
                 x1 = max(0, bx - pad_x)
@@ -223,25 +281,24 @@ def _read_route_number(frame: "np.ndarray") -> tuple[str | None, "tuple | None"]
                 x2 = min(w, bx + bw + pad_x)
                 y2 = min(h, by + bh + pad_y)
                 roi = frame[y1:y2, x1:x2]
-                # 3× upscale (LANCZOS) + strong unsharp mask for motion frames
-                roi = cv2.resize(roi, (roi.shape[1] * 3, roi.shape[0] * 3),
-                                 interpolation=cv2.INTER_LANCZOS4)
+                roi = cv2.resize(
+                    roi,
+                    (roi.shape[1] * 3, roi.shape[0] * 3),
+                    interpolation=cv2.INTER_LANCZOS4,
+                )
                 roi = _sharpen_roi(roi, strength=1.8)
                 result, _ = ocr(roi)
                 if result:
-                    # allow_bare_number=True: spatial context confirms this is the placard
                     r, a = _ocr_scan_for_route(result, "yellow_mask", allow_bare_number=True)
                     if r and a > best_area:
                         best_area = a
                         best_route = r
-                    # Always log so we can tune the regex
-                    texts = [(str(l[1]).strip(), round(float(l[2]), 3))
-                             for l in result if len(l) >= 3]
+                    texts = [
+                        (str(l[1]).strip(), round(float(l[2]), 3))
+                        for l in result
+                        if len(l) >= 3
+                    ]
                     log.info("route yellow_mask OCR: match=%s texts=%s", r, texts[:10])
-                # Stash the placard geometry so the pipeline can draw a
-                # yellow box on the snapshot regardless of OCR outcome —
-                # even if we couldn't read the digits, seeing the rectangle
-                # confirms the colour mask is finding the right blob.
                 placard_conf = 0.0
                 if result:
                     try:
@@ -251,25 +308,29 @@ def _read_route_number(frame: "np.ndarray") -> tuple[str | None, "tuple | None"]
                 placard_bbox = (x1, y1, x2, y2, placard_conf)
 
         # ------------------------------------------------------------------ #
-        # Pass 2: ONE windshield-band crop (only if yellow mask missed)      #
+        # Pass 2: windshield band ONLY within the vehicle union (not full width)
         # ------------------------------------------------------------------ #
         if not best_route:
-            top = int(h * 0.10)
-            bot = int(h * 0.55)
-            roi = frame[top:bot, :].copy()
+            vh = uy2 - uy1
+            wy1 = uy1 + int(vh * 0.02)
+            wy2 = uy1 + int(vh * 0.58)
+            roi = frame[wy1:wy2, ux1:ux2].copy()
             if roi.size > 0:
-                roi = cv2.resize(roi, (roi.shape[1] * 2, roi.shape[0] * 2),
-                                 interpolation=cv2.INTER_LINEAR)
-                roi = _sharpen_roi(roi, strength=1.2)
+                roi = cv2.resize(
+                    roi,
+                    (roi.shape[1] * 2, roi.shape[0] * 2),
+                    interpolation=cv2.INTER_LANCZOS4,
+                )
+                roi = _sharpen_roi(roi, strength=1.35)
                 result, _ = ocr(roi)
                 if result:
-                    r, a = _ocr_scan_for_route(result, "windshield")
+                    r, a = _ocr_scan_for_route(result, "windshield_bus")
                     if r and a > best_area:
                         best_area = a
                         best_route = r
 
         if best_route:
-            log.info("route OCR winner: %s  area=%.0f", best_route, best_area)
+            log.info("route OCR winner: %s  score=%.0f (bus-gated)", best_route, best_area)
         return best_route, placard_bbox
     except Exception as exc:
         log.warning("route OCR exception: %s", exc)
@@ -798,11 +859,15 @@ def run_rtsp_loop(
                 """Kick off plate + route OCR for one frame, return the futures."""
                 _f_copy = _f.copy()
                 t0 = time.time()
+                # Vehicle boxes synchronously so route placard OCR never scans
+                # the full frame (random yellow signs / road markings).
+                vboxes = _vehicle_boxes_for_route(_f)
                 return {
                     "frame": _f,
                     "frame_copy": _f_copy,
                     "captured_at": _captured_at,
                     "submitted_at": t0,
+                    "vehicle_boxes": vboxes,
                     "plate_fut": _pool.submit(
                         read_plates_from_frame,
                         _f,
@@ -811,7 +876,7 @@ def run_rtsp_loop(
                         detection_mode=s.PLATE_DETECTION_MODE.strip().lower(),
                         vision_stack=s.VISION_STACK,
                     ),
-                    "route_fut": _pool.submit(_read_route_number, _f_copy),
+                    "route_fut": _pool.submit(_read_route_number, _f_copy, vboxes),
                 }
 
             while True:
@@ -841,6 +906,7 @@ def run_rtsp_loop(
                 frame_copy = current["frame_copy"]
                 captured_at = current["captured_at"]
                 t_ocr = current["submitted_at"]
+                vboxes_dbg = current.get("vehicle_boxes") or []
                 _plate_fut = current["plate_fut"]
                 _route_fut = current["route_fut"]
 
@@ -927,6 +993,7 @@ def run_rtsp_loop(
                             "route": route,
                             "snapshot_b64": snap_b64,
                             "n_plate_boxes": len(plate_boxes or []),
+                            "n_vehicles": len(vboxes_dbg),
                             "has_placard_box": placard_bbox is not None,
                         },
                         bypass_interval=bool(plates),
@@ -1035,11 +1102,13 @@ def run_webcam_loop(
             def _submit_frame_wc(_f, _captured_at: float) -> dict:
                 t0 = time.time()
                 _f_copy = _f.copy()
+                vboxes = _vehicle_boxes_for_route(_f)
                 return {
                     "frame": _f,
                     "frame_copy": _f_copy,
                     "captured_at": _captured_at,
                     "submitted_at": t0,
+                    "vehicle_boxes": vboxes,
                     "plate_fut": _pool.submit(
                         read_plates_from_frame,
                         _f,
@@ -1048,7 +1117,7 @@ def run_webcam_loop(
                         detection_mode=s.PLATE_DETECTION_MODE.strip().lower(),
                         vision_stack=s.VISION_STACK,
                     ),
-                    "route_fut": _pool.submit(_read_route_number, _f_copy),
+                    "route_fut": _pool.submit(_read_route_number, _f_copy, vboxes),
                 }
 
             while True:
@@ -1074,6 +1143,7 @@ def run_webcam_loop(
                 frame_copy = current["frame_copy"]
                 captured_at = current["captured_at"]
                 t_ocr = current["submitted_at"]
+                vboxes_dbg = current.get("vehicle_boxes") or []
                 _plate_fut = current["plate_fut"]
                 _route_fut = current["route_fut"]
 
@@ -1129,6 +1199,7 @@ def run_webcam_loop(
                             "route": route,
                             "snapshot_b64": frame_to_jpeg_b64(annotated, 720),
                             "n_plate_boxes": len(plate_boxes or []),
+                            "n_vehicles": len(vboxes_dbg),
                             "has_placard_box": placard_bbox is not None,
                         },
                     )

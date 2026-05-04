@@ -481,7 +481,7 @@ def _enhance_vehicle_crop(crop: "NDArray[np.uint8]", *, target_min_width: int = 
     # 2. CLAHE on L channel (LAB) — boosts plate text contrast without colour shift
     lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=4.5, tileGridSize=(8, 8))
     l_ch = clahe.apply(l_ch)
     enhanced = cv2.merge([l_ch, a_ch, b_ch])
     enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)

@@ -61,13 +61,10 @@ os.environ["YOLO_DEVICE"] = _DEFAULT_YOLO_DEVICE
 os.environ["YOLO_HALF"] = "1" if _DEFAULT_YOLO_HALF else "0"
 os.environ["OCR_GPU"] = "1" if _DEFAULT_OCR_GPU else "0"
 
-# Push GPU harder when we actually have a GPU. The T1000 (4 GB, 768 CUDA
-# cores) handles 1280×1280 in ~25 ms — well under one frame at 30 fps.
-# 1280 finds plates that are only 12-15 px tall in a 1080p frame, which
-# is roughly the size of a school-bus plate at ~30 m. If you don't need
-# that range, set YOLO_IMGSZ=960 in .env to halve the GPU load.
+# Push GPU harder when we actually have a GPU. Default 1536 improves tiny-plate
+# recall on sharp feeds; set YOLO_IMGSZ=1280 or 960 in .env if latency spikes.
 if _DEFAULT_YOLO_DEVICE.startswith("cuda"):
-    os.environ.setdefault("YOLO_IMGSZ", "1280")
+    os.environ.setdefault("YOLO_IMGSZ", "1536")
     # cuDNN autotune picks the fastest convolution algorithm for the input
     # size on first call — ~10-15% faster YOLO from frame 2 onwards.
     try:
@@ -119,10 +116,10 @@ class VisionSettings(BaseSettings):
     """YOLO inference device. Auto: cuda:0 if CUDA detected, else cpu. Override with YOLO_DEVICE env."""
     YOLO_HALF: bool = _DEFAULT_YOLO_HALF
     """FP16 inference for YOLO on CUDA — halves VRAM, ~2× faster on T1000+. Auto-on for CUDA."""
-    YOLO_IMGSZ: int = 1280
-    """Image size for YOLO inference. 640 = fastest on CPU; 960 = balanced;
-    1280 = maximum recall on distant / small plates (default on CUDA).
-    The T1000 runs 1280 in ~25 ms which is well under 33 ms / frame at 30 fps."""
+    YOLO_IMGSZ: int = 1536
+    """Image size for YOLO inference. 640 = fastest on CPU; 1280 = balanced;
+    1536 = maximum recall for clear plates at gate distance (default on CUDA).
+    Override with YOLO_IMGSZ in .env if latency is too high."""
     PLATE_DETECTION_MODE: str = "opencv_roi"
     """Used when VISION_STACK=rapid: opencv_roi | fullframe."""
     PLATE_FILTER: str = "indian"
@@ -148,6 +145,9 @@ class VisionSettings(BaseSettings):
     that no read under 50% confidence ever surfaces in the live feed —
     set INGEST_MIN_CONFIDENCE=0 in .env to disable the gate (accept all
     OCR reads that pass MIN_CONFIDENCE)."""
+    PLATE_OCR_TARGET_MIN_WIDTH: int = 720
+    """Upscale each plate ROI to at least this width before EasyOCR. Higher =
+    more GPU RAM + time but materially better character accuracy on sharp feeds."""
     SNAPSHOT_MAX_WIDTH: int = 960
     """Max width in px for the dashboard snapshot. 520 was destroying plate
     legibility — at typical capture distance a plate is ~60 px wide and

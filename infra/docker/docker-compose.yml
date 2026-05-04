@@ -152,7 +152,7 @@ services:
       YOLO_DEVICE: ${YOLO_DEVICE:-auto}
       YOLO_HALF: ${YOLO_HALF:-auto}
       # 1280 = max recall (default on CUDA). 960 = balanced. 640 = CPU-only.
-      YOLO_IMGSZ: ${YOLO_IMGSZ:-1280}
+      YOLO_IMGSZ: ${YOLO_IMGSZ:-1536}
       # Hard ingest floor: drop any plate read whose combined score is
       # below this. The user requirement: nothing under 50% reaches the
       # dashboard. Set 0 to accept everything that passes MIN_CONFIDENCE.
