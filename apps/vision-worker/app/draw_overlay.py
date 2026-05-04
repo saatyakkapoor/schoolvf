@@ -30,8 +30,8 @@ import numpy as np
 
 # BGR colours so they survive jpeg encoding well.
 _COLOR_VEHICLE = (60, 220, 60)       # green
-_COLOR_PLATE_HIT = (0, 0, 255)       # red — plate the OCR actually read
-_COLOR_PLATE_REGION = (0, 165, 255)  # orange — candidate region (no successful read)
+_COLOR_PLATE_HIT = (0, 0, 255)       # red — OCR produced an accepted plate string
+_COLOR_PLATE_REGION = (0, 165, 255)  # orange — detector only; OCR/validator did not accept a read
 _COLOR_ROUTE = (0, 230, 230)         # yellow — route placard
 _COLOR_BUMPER = (255, 180, 80)       # blue — bumper crop region
 

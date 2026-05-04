@@ -755,7 +755,7 @@ def read_plates_from_frame(
         log.warning("plate YOLO error: %s", exc)
 
     if merged:
-        return [(p, merged[p]) for p in sorted(merged)]
+        return [(p, merged[p]) for p in sorted(merged)], []
 
     # ── Step 2: OpenCV contour scan (only when YOLO found nothing) ───────────
     # Contour scan finds plate-shaped rectangular edges in the image.

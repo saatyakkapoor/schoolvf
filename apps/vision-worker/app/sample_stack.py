@@ -416,6 +416,12 @@ def _fast_text_cleaning(text: str) -> str | None:
 _OCR_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 
+def _candidate_plate_overlay(det_conf: float, *, note: str = "") -> str:
+    """Label for orange boxes: detector saw a plate-like region but no plate string was accepted."""
+    s = f"no OCR match · det {det_conf:.2f}"
+    return s + note
+
+
 def _bbox_left_x(bbox: Any) -> float:
     arr = np.asarray(bbox, dtype=np.float64)
     return float(arr[:, 0].min())
@@ -621,7 +627,7 @@ def read_plates_sample_stack(
                 best_q,
                 by_method,
             )
-        return []
+        return [], []
 
     reader = get_easyocr_reader()
     # Lower floor so EasyOCR reads in the 0.10–0.25 range (common for distant/blurry plates)
@@ -902,8 +908,8 @@ def read_plates_sample_stack(
                                     label = max(new_plates, key=len) if new_plates else None
                                     label_conf = merged.get(label or "", pconf) if label else pconf
                                 else:
-                                    label = None
-                                    label_conf = pconf
+                                    label = _candidate_plate_overlay(pconf)
+                                    label_conf = None
                                 overlay_add_plate_region(
                                     plate_abs_bbox,
                                     text=label,
@@ -961,8 +967,9 @@ def read_plates_sample_stack(
                                 lab = max(new_p, key=len) if new_p else None
                                 lab_conf = merged.get(lab or "", 0.0) if lab else None
                             else:
-                                lab = None
-                                lab_conf = float(cand.get("quality_score") or 0.0) or None
+                                q = float(cand.get("quality_score") or 0.0)
+                                lab = _candidate_plate_overlay(q, note=" · contour")
+                                lab_conf = None
                             overlay_add_plate_region(
                                 abs_box, text=lab,
                                 conf=lab_conf,
@@ -994,7 +1001,7 @@ def read_plates_sample_stack(
                         lab = max(new_p, key=len) if new_p else None
                         lab_conf = merged.get(lab or "", 0.0) if lab else None
                     else:
-                        lab = None
+                        lab = _candidate_plate_overlay(0.40, note=" · bumper crop")
                         lab_conf = None
                     overlay_add_plate_region(
                         bumper_abs_box, text=lab, conf=lab_conf, accepted=accepted,
