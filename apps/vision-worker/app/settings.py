@@ -63,21 +63,21 @@ os.environ["OCR_GPU"] = "1" if _DEFAULT_OCR_GPU else "0"
 
 # Push GPU harder when we actually have a GPU. Default 1536 improves tiny-plate
 # recall on sharp feeds; set YOLO_IMGSZ=1280 or 960 in .env if latency spikes.
-    if _DEFAULT_YOLO_DEVICE.startswith("cuda"):
-        os.environ.setdefault("YOLO_IMGSZ", "1536")
-        # cuDNN autotune picks the fastest convolution algorithm for the input
-        # size on first call — ~10-15% faster YOLO from frame 2 onwards.
-        try:
-            import torch  # type: ignore
-            torch.backends.cudnn.benchmark = True
-            if hasattr(torch.backends.cuda, "matmul"):
-                torch.backends.cuda.matmul.allow_tf32 = True
-            if hasattr(torch.backends.cudnn, "allow_tf32"):
-                torch.backends.cudnn.allow_tf32 = True
-            if hasattr(torch, "set_float32_matmul_precision"):
-                torch.set_float32_matmul_precision("high")
-        except Exception:
-            pass
+if _DEFAULT_YOLO_DEVICE.startswith("cuda"):
+    os.environ.setdefault("YOLO_IMGSZ", "1536")
+    # cuDNN autotune picks the fastest convolution algorithm for the input
+    # size on first call — ~10-15% faster YOLO from frame 2 onwards.
+    try:
+        import torch  # type: ignore
+        torch.backends.cudnn.benchmark = True
+        if hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = True
+        if hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
 else:
     os.environ.setdefault("YOLO_IMGSZ", "640")
 
