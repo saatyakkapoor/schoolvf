@@ -500,7 +500,7 @@ def _easyocr_read_roi(
     if roi is None or roi.size == 0:
         return None, 0.0
     try:
-        frag_floor = max(0.08, ocr_min * 0.42)
+        frag_floor = max(0.055, ocr_min * 0.36)
         try:
             results = reader.readtext(
                 roi,
@@ -594,6 +594,8 @@ def read_plates_sample_stack(
     # GPU but reads clear plates far more reliably than 300 px.
     ocr_target_w = max(480, int(getattr(s, "PLATE_OCR_TARGET_MIN_WIDTH", 720)))
     ocr_bumper_w = max(ocr_target_w, 560)
+    bumper_top_frac = max(0.20, min(0.55, float(s.VEHICLE_BUMPER_TOP_FRAC)))
+    plate_yolo_conf = max(0.02, min(0.45, float(s.PLATE_YOLO_MIN_CONF)))
 
     det = get_detector()
 
@@ -630,10 +632,9 @@ def read_plates_sample_stack(
         return [], []
 
     reader = get_easyocr_reader()
-    # Lower floor so EasyOCR reads in the 0.10–0.25 range (common for distant/blurry plates)
-    # aren't thrown away. The validator's regex + state correction is strict enough that
-    # we don't need a high confidence floor to keep noise out.
-    ocr_floor = max(float(min_confidence), 0.10)
+    # Lower floor so EasyOCR keeps weak-but-readable fragments; validator filters noise.
+    ocr_floor = max(float(min_confidence), 0.07)
+    veh_ocr_min = max(0.055, float(min_confidence))
 
     merged: dict[str, float] = {}
     _rejected_reads: list[str] = []  # diagnostic: collect rejected texts
@@ -674,14 +675,7 @@ def read_plates_sample_stack(
                  source, norm_key, ocr_conf, quality, combined)
 
     # ── Per-frame OCR budget ──────────────────────────────────────────────
-    # Hard cap on the number of EasyOCR calls per frame so a vehicle that
-    # produces 10 candidate ROIs can never push cycle time past ~1 second.
-    # EasyOCR ≈ 80-200 ms per call on the T1000, so 6 calls ≈ 800 ms worst
-    # case. We need 6 (not 4) so we can ALWAYS run both the tight and the
-    # downward-extended crop on the highest-confidence plate-YOLO box —
-    # without that, two-line plates like "HR55B / BC2973" report only the
-    # first line ("HR55B" → "HR558" after digit-letter swap).
-    OCR_BUDGET = 6
+    OCR_BUDGET = max(6, min(16, int(s.PLATE_OCR_BUDGET)))
     ocr_calls = 0
 
     def _ocr_with_budget(roi_img, *, ocr_min: float) -> tuple[str | None, float]:
@@ -736,10 +730,10 @@ def read_plates_sample_stack(
                 if x2 - x1 < 30 or y2 - y1 < 20:
                     continue
 
-                # ★ Restrict to the BOTTOM 50% of the vehicle — that's the
-                # bumper. Keeps body-paint text out of OCR completely.
+                # Lower portion of vehicle (bumper/grille); fraction from settings
+                # so high plates / loose vehicle boxes still crop the plate band.
                 vh_total = y2 - y1
-                bumper_top = y1 + int(vh_total * 0.45)
+                bumper_top = y1 + int(vh_total * bumper_top_frac)
                 bumper_crop = frame[bumper_top:y2, x1:x2]
                 if bumper_crop.size == 0:
                     continue
@@ -790,8 +784,8 @@ def read_plates_sample_stack(
                         except ValueError:
                             imgsz = 0
                         yolo_kwargs = dict(
-                            conf=0.10,  # lowered: catches blurry / distant plates
-                            iou=0.4,
+                            conf=plate_yolo_conf,
+                            iou=0.45,
                             device=device,
                             half=half,
                             verbose=False,
@@ -806,7 +800,7 @@ def read_plates_sample_stack(
                                 plate_results[0].boxes,
                                 key=lambda b: float(b.conf[0].cpu().numpy()),
                                 reverse=True,
-                            )
+                            )[:5]
                             for pbox in sorted_boxes:
                                 if ocr_calls >= OCR_BUDGET:
                                     break
@@ -822,7 +816,7 @@ def read_plates_sample_stack(
 
                                 ph = py2 - py1
                                 pw = px2 - px1
-                                if pw < 10 or ph < 6:
+                                if pw < 8 or ph < 5:
                                     continue
 
                                 # Padding around the YOLO box. Plate
@@ -871,7 +865,7 @@ def read_plates_sample_stack(
                                         plate_enh,
                                         source="veh_plate",
                                         quality=max(0.5, pconf),
-                                        ocr_min=0.10,
+                                        ocr_min=veh_ocr_min,
                                     )
 
                                 # Crop 2: 2-line extension (always run unless
@@ -892,7 +886,7 @@ def read_plates_sample_stack(
                                             ext_enh,
                                             source="veh_plate_2line",
                                             quality=max(0.45, pconf * 0.9),
-                                            ocr_min=0.10,
+                                            ocr_min=veh_ocr_min,
                                         )
 
                                 # Mark the box on the overlay. Accepted (red)
@@ -920,11 +914,9 @@ def read_plates_sample_stack(
                         log.warning("  → plate YOLO on bumper crop failed: %s", e)
 
                 # Method B: OpenCV contour-based plate finder on the bumper.
-                # Used whenever plate-YOLO didn't fire (model missing or no
-                # box passed conf=0.10 inside this bumper). Without this
-                # step, "no plate-YOLO model" silently meant "no plate boxes
-                # at all" and the user never saw a red/orange overlay.
-                if not plate_rois_found and ocr_calls < OCR_BUDGET:
+                # Run whenever we still have no accepted plate — including when
+                # plate-YOLO fired on a junk box and OCR failed.
+                if not merged and ocr_calls < OCR_BUDGET:
                     try:
                         from apps.vision_worker.app.plate_detection import (
                             collect_plate_region_candidates,
@@ -940,7 +932,7 @@ def read_plates_sample_stack(
                             key=lambda d: float(d.get("quality_score") or 0.0),
                             reverse=True,
                         )
-                        for cand in contour_cands[:2]:
+                        for cand in contour_cands[:3]:
                             if ocr_calls >= OCR_BUDGET:
                                 break
                             cx1, cy1, cx2, cy2 = cand["bbox"]
@@ -959,7 +951,7 @@ def read_plates_sample_stack(
                                 roi_enh,
                                 source=f"veh_cnt_{cand.get('method', '')[:6]}",
                                 quality=float(cand.get("quality_score", 0.4)),
-                                ocr_min=0.10,
+                                ocr_min=veh_ocr_min,
                             )
                             accepted = (len(merged) > len(merged_before))
                             if accepted:
@@ -978,10 +970,8 @@ def read_plates_sample_stack(
                     except Exception as e:
                         log.warning("  → contour fallback failed: %s", e)
 
-                # Method C: still nothing? OCR the whole bumper as one big
-                # crop. This is a hail-mary — the bumper crop excludes
-                # body paint so it's much safer than a full-frame pass.
-                if not plate_rois_found and not merged and ocr_calls < OCR_BUDGET:
+                # Method C: whole bumper crop if YOLO/contour still produced no read.
+                if not merged and ocr_calls < OCR_BUDGET:
                     bumper_enh = _enhance_vehicle_crop(
                         bumper_crop, target_min_width=ocr_bumper_w
                     )
@@ -990,7 +980,7 @@ def read_plates_sample_stack(
                         bumper_enh,
                         source="veh_bumper",
                         quality=0.40,
-                        ocr_min=0.10,
+                        ocr_min=veh_ocr_min,
                     )
                     # Mark the bumper crop on the overlay so the user
                     # can see "we did try OCR on the whole bumper".

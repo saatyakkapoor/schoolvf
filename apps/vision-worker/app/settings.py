@@ -142,7 +142,7 @@ class VisionSettings(BaseSettings):
     CAMERA_COOLDOWN_SEC: float = 15.0
     """After ANY plate posts from a camera, silence that camera for this many seconds.
     Prevents the same physical car being logged 3-4 times as OCR misreads it on successive frames."""
-    MIN_CONFIDENCE: float = 0.09
+    MIN_CONFIDENCE: float = 0.065
     """OCR score floor for ROI crops. Fullframe fallback uses an even lower floor automatically.
     Lower = more reads (some noise), higher = fewer reads (misses moving-bus plates).
     Note: this controls *recognition* — what the OCR engine accepts internally. The
@@ -154,6 +154,13 @@ class VisionSettings(BaseSettings):
     that no read under 50% confidence ever surfaces in the live feed —
     set INGEST_MIN_CONFIDENCE=0 in .env to disable the gate (accept all
     OCR reads that pass MIN_CONFIDENCE)."""
+    VEHICLE_BUMPER_TOP_FRAC: float = 0.34
+    """Vehicle bbox crop: plate search starts at y1 + this fraction × vehicle height (smaller =
+    taller crop includes grille / high-mounted plates; max ~0.5). Was hardcoded 0.45."""
+    PLATE_YOLO_MIN_CONF: float = 0.06
+    """Min confidence for license_plate_detector.pt inside the bumper ROI (lower = more boxes, more OCR)."""
+    PLATE_OCR_BUDGET: int = 10
+    """Max EasyOCR forward passes per frame in the sample stack (tight + 2-line crops count separately)."""
     PLATE_OCR_TARGET_MIN_WIDTH: int = 720
     """Upscale each plate ROI to at least this width before EasyOCR. Higher =
     more GPU RAM + time but materially better character accuracy on sharp feeds."""
