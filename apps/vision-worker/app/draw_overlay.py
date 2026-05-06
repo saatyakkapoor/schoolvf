@@ -11,7 +11,7 @@ snapshot just before the JPEG encode.
 Usage from a worker thread:
     overlay_reset()
     overlay_add_vehicle((x1,y1,x2,y2), conf=0.83)
-    overlay_add_plate_region((x1,y1,x2,y2), text="HR55BC2973", conf=0.71, accepted=True)
+    overlay_add_plate_region((x1,y1,x2,y2), text="HR55BC2973", conf=0.71, accepted=True)  # yellow box
     boxes = overlay_drain()                # returns list[BoxRecord], clears bag
 
 From the main thread:
@@ -29,11 +29,13 @@ import numpy as np
 
 
 # BGR colours so they survive jpeg encoding well.
-_COLOR_VEHICLE = (60, 220, 60)       # green
-_COLOR_PLATE_HIT = (0, 0, 255)       # red — OCR produced an accepted plate string
-_COLOR_PLATE_REGION = (0, 165, 255)  # orange — detector only; OCR/validator did not accept a read
-_COLOR_ROUTE = (0, 230, 230)         # yellow — route placard
-_COLOR_BUMPER = (255, 180, 80)       # blue — bumper crop region
+_COLOR_VEHICLE = (60, 220, 60)       # green — bus body
+# Yellow targets (placard + plate reads): same hue so both read as “yellow ROI” on snapshots.
+_COLOR_YELLOW_TARGET = (0, 230, 230)
+_COLOR_ROUTE = _COLOR_YELLOW_TARGET
+_COLOR_PLATE_HIT = _COLOR_YELLOW_TARGET
+_COLOR_PLATE_REGION = _COLOR_YELLOW_TARGET
+_COLOR_BUMPER = (255, 180, 80)       # blue — bumper crop region (debug)
 
 
 @dataclass
@@ -91,8 +93,14 @@ def overlay_add_bumper(bbox) -> None:
 
 def overlay_add_plate_region(bbox, *, text: str | None = None, conf: float | None = None,
                              accepted: bool = False) -> None:
-    color = _COLOR_PLATE_HIT if accepted else _COLOR_PLATE_REGION
-    overlay_add(bbox, color=color, label=text, conf=conf, thickness=2 if accepted else 1)
+    # Same yellow as placard; thicker outline when OCR accepted the read.
+    overlay_add(
+        bbox,
+        color=_COLOR_YELLOW_TARGET,
+        label=text,
+        conf=conf,
+        thickness=3 if accepted else 2,
+    )
 
 
 def overlay_add_route_box(bbox, *, text: str | None = None, conf: float | None = None) -> None:
@@ -106,7 +114,7 @@ def make_route_box(bbox, *, text: str | None = None, conf: float | None = None) 
     plain tuple from the route-OCR future (different thread).
     """
     x1, y1, x2, y2 = (int(v) for v in bbox)
-    return BoxRecord((x1, y1, x2, y2), _COLOR_ROUTE, text, conf, 2)
+    return BoxRecord((x1, y1, x2, y2), _COLOR_YELLOW_TARGET, text, conf, 3)
 
 
 def render_overlay(frame: np.ndarray, boxes: list[BoxRecord]) -> np.ndarray:
@@ -125,11 +133,10 @@ def render_overlay(frame: np.ndarray, boxes: list[BoxRecord]) -> np.ndarray:
     importance = {
         _COLOR_BUMPER: 0,
         _COLOR_VEHICLE: 1,
-        _COLOR_PLATE_REGION: 2,
-        _COLOR_PLATE_HIT: 3,
-        _COLOR_ROUTE: 3,
+        _COLOR_YELLOW_TARGET: 2,
     }
-    boxes = sorted(boxes, key=lambda b: importance.get(b.color, 0))
+    # Thicker boxes (accepted reads / placard) paint on top within the yellow group.
+    boxes = sorted(boxes, key=lambda b: (importance.get(b.color, 1), b.thickness))
 
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = max(0.5, min(0.9, fw / 1600))

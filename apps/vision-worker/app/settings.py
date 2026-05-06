@@ -63,19 +63,21 @@ os.environ["OCR_GPU"] = "1" if _DEFAULT_OCR_GPU else "0"
 
 # Push GPU harder when we actually have a GPU. Default 1536 improves tiny-plate
 # recall on sharp feeds; set YOLO_IMGSZ=1280 or 960 in .env if latency spikes.
-if _DEFAULT_YOLO_DEVICE.startswith("cuda"):
-    os.environ.setdefault("YOLO_IMGSZ", "1536")
-    # cuDNN autotune picks the fastest convolution algorithm for the input
-    # size on first call — ~10-15% faster YOLO from frame 2 onwards.
-    try:
-        import torch  # type: ignore
-        torch.backends.cudnn.benchmark = True
-        if hasattr(torch.backends.cuda, "matmul"):
-            torch.backends.cuda.matmul.allow_tf32 = True
-        if hasattr(torch.backends.cudnn, "allow_tf32"):
-            torch.backends.cudnn.allow_tf32 = True
-    except Exception:
-        pass
+    if _DEFAULT_YOLO_DEVICE.startswith("cuda"):
+        os.environ.setdefault("YOLO_IMGSZ", "1536")
+        # cuDNN autotune picks the fastest convolution algorithm for the input
+        # size on first call — ~10-15% faster YOLO from frame 2 onwards.
+        try:
+            import torch  # type: ignore
+            torch.backends.cudnn.benchmark = True
+            if hasattr(torch.backends.cuda, "matmul"):
+                torch.backends.cuda.matmul.allow_tf32 = True
+            if hasattr(torch.backends.cudnn, "allow_tf32"):
+                torch.backends.cudnn.allow_tf32 = True
+            if hasattr(torch, "set_float32_matmul_precision"):
+                torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
 else:
     os.environ.setdefault("YOLO_IMGSZ", "640")
 
@@ -97,6 +99,13 @@ class VisionSettings(BaseSettings):
     """How often to refresh camera list from API (URLs / active flags)."""
     PROCESS_INTERVAL_SEC: float = 0.0
     """Seconds to sleep after each processed frame. 0 = run as fast as OCR/detection allows."""
+    GATE_VEHICLE_SETTLE_SEC: float = 1.0
+    """After a bus first appears in frame, wait this many seconds before starting plate+route OCR
+    on live frames. Uses the sharpest *current* frame at deadline (grabber keeps draining RTSP backlog).
+    0 = legacy behaviour (OCR immediately)."""
+    OCR_POOL_WORKERS: int = 8
+    """ThreadPoolExecutor size for plate+route futures. Higher overlaps more cameras / prefetch;
+    GPU kernels still serialize on one device but overlap CPU decode + queue prep."""
     RTSP_GRAB_DRAIN: int = 1
     """grab() this many times before retrieve(); 1 = lowest latency, higher = stabler but slower."""
     HTTP_POST_WORKERS: int = 16

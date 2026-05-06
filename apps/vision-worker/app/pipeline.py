@@ -460,14 +460,14 @@ _ocr_pool: ThreadPoolExecutor | None = None
 
 
 def _get_ocr_pool() -> ThreadPoolExecutor:
-    """Persistent OCR worker pool. Sized for the double-buffered pipeline:
-    each cycle uses 2 slots (plate + route OCR), and we keep up to 2 cycles
-    in flight (current consuming results, next prefetched). 6 leaves headroom
-    for an edge case where the current cycle is still finishing as the next
-    one starts."""
+    """Persistent OCR worker pool for plate + route futures (prefetch-friendly)."""
     global _ocr_pool
     if _ocr_pool is None:
-        _ocr_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="ocr")
+        try:
+            w = max(2, int(get_settings().OCR_POOL_WORKERS))
+        except Exception:
+            w = 8
+        _ocr_pool = ThreadPoolExecutor(max_workers=w, thread_name_prefix="ocr")
     return _ocr_pool
 
 
@@ -854,14 +854,25 @@ def run_rtsp_loop(
             pending: dict | None = None
             strict_indian = s.PLATE_FILTER.strip().lower() == "indian"
             _pool = _get_ocr_pool()
+            # Gate timing: first vehicle sighting starts a timer; OCR waits until the bus advances.
+            vehicle_episode_t0: float | None = None
+            vehicle_settled: bool = False
 
-            def _submit_frame(_f, _captured_at: float) -> dict:
+            def _submit_frame(
+                _f,
+                _captured_at: float,
+                vboxes_pre: list[tuple[int, int, int, int]] | None = None,
+            ) -> dict:
                 """Kick off plate + route OCR for one frame, return the futures."""
                 _f_copy = _f.copy()
                 t0 = time.time()
                 # Vehicle boxes synchronously so route placard OCR never scans
                 # the full frame (random yellow signs / road markings).
-                vboxes = _vehicle_boxes_for_route(_f)
+                vboxes = (
+                    list(vboxes_pre)
+                    if vboxes_pre is not None
+                    else _vehicle_boxes_for_route(_f)
+                )
                 return {
                     "frame": _f,
                     "frame_copy": _f_copy,
@@ -897,7 +908,29 @@ def run_rtsp_loop(
                         time.sleep(0.02)
                         continue
                     stale_count = 0
-                    pending = _submit_frame(frame, captured_at)
+                    settle_sec = float(s.GATE_VEHICLE_SETTLE_SEC)
+                    vboxes_pre: list[tuple[int, int, int, int]] | None = None
+                    if settle_sec > 0:
+                        vboxes_pre = _vehicle_boxes_for_route(frame)
+                        if not vboxes_pre:
+                            vehicle_episode_t0 = None
+                            vehicle_settled = False
+                            time.sleep(0.02)
+                            continue
+                        if vehicle_episode_t0 is None:
+                            vehicle_episode_t0 = time.monotonic()
+                            vehicle_settled = False
+                            log.info(
+                                "camera %s gate: vehicle seen — waiting %.2fs before OCR",
+                                cid, settle_sec,
+                            )
+                        if not vehicle_settled:
+                            elapsed = time.monotonic() - vehicle_episode_t0
+                            if elapsed < settle_sec:
+                                time.sleep(min(0.05, settle_sec - elapsed + 0.005))
+                                continue
+                            vehicle_settled = True
+                    pending = _submit_frame(frame, captured_at, vboxes_pre=vboxes_pre)
 
                 # Step 2: wait for the in-flight plate OCR to finish.
                 current = pending
@@ -1098,11 +1131,21 @@ def run_webcam_loop(
             strict_indian = s.PLATE_FILTER.strip().lower() == "indian"
             _pool = _get_ocr_pool()
             pending: dict | None = None
+            vehicle_episode_t0_wc: float | None = None
+            vehicle_settled_wc: bool = False
 
-            def _submit_frame_wc(_f, _captured_at: float) -> dict:
+            def _submit_frame_wc(
+                _f,
+                _captured_at: float,
+                vboxes_pre: list[tuple[int, int, int, int]] | None = None,
+            ) -> dict:
                 t0 = time.time()
                 _f_copy = _f.copy()
-                vboxes = _vehicle_boxes_for_route(_f)
+                vboxes = (
+                    list(vboxes_pre)
+                    if vboxes_pre is not None
+                    else _vehicle_boxes_for_route(_f)
+                )
                 return {
                     "frame": _f,
                     "frame_copy": _f_copy,
@@ -1135,7 +1178,29 @@ def run_webcam_loop(
                         time.sleep(0.02)
                         continue
                     stale_count = 0
-                    pending = _submit_frame_wc(frame, captured_at)
+                    settle_sec = float(s.GATE_VEHICLE_SETTLE_SEC)
+                    vpre: list[tuple[int, int, int, int]] | None = None
+                    if settle_sec > 0:
+                        vpre = _vehicle_boxes_for_route(frame)
+                        if not vpre:
+                            vehicle_episode_t0_wc = None
+                            vehicle_settled_wc = False
+                            time.sleep(0.02)
+                            continue
+                        if vehicle_episode_t0_wc is None:
+                            vehicle_episode_t0_wc = time.monotonic()
+                            vehicle_settled_wc = False
+                            log.info(
+                                "camera %s webcam gate: vehicle seen — waiting %.2fs before OCR",
+                                cid, settle_sec,
+                            )
+                        if not vehicle_settled_wc:
+                            elapsed = time.monotonic() - vehicle_episode_t0_wc
+                            if elapsed < settle_sec:
+                                time.sleep(min(0.05, settle_sec - elapsed + 0.005))
+                                continue
+                            vehicle_settled_wc = True
+                    pending = _submit_frame_wc(frame, captured_at, vboxes_pre=vpre)
 
                 current = pending
                 pending = None
