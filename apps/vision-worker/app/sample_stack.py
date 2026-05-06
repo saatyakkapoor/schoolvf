@@ -439,28 +439,34 @@ def _bbox_height(bbox: Any) -> float:
 
 def _stacked_two_line_merge(results: list) -> list[tuple[str, float]]:
     """
-    Reconstruct two-line stacked Indian plates from EasyOCR results.
+    Reconstruct stacked/fragmented Indian plates from EasyOCR results.
 
-    Indian school buses use HSRP plates that are often two-line:
-        Top:    DL3C AB
-        Bottom: 1234
-    EasyOCR returns each line as a separate result; this function clusters
-    them into rows by Y-centre proximity, sorts each row L→R, and emits
-    candidate strings ordered top→bottom.
+    EasyOCR often returns:
+      - one token per fragment ("DL", "3CAB", "1234"), or
+      - two lines with slight tilt / skew.
+    We cluster by row using Y-centres, then merge adjacent rows (2-line and
+    3-line cases) with a proximity gate.
     """
     if not results or len(results) < 2:
         return []
-    items: list[tuple[float, float, float, str, float]] = []  # (y_top, y_height, x_left, text, conf)
+
+    # (y_center, y_height, x_left, text, conf)
+    items: list[tuple[float, float, float, str, float]] = []
     for bbox, text, conf in results:
         try:
             t = re.sub(r"[^A-Z0-9]", "", str(text).upper())
             if not t:
                 continue
-            items.append((_bbox_top_y(bbox), _bbox_height(bbox), _bbox_left_x(bbox), t, float(conf)))
+            yt = _bbox_top_y(bbox)
+            h = max(_bbox_height(bbox), 1.0)
+            yc = yt + (h * 0.5)
+            items.append((yc, h, _bbox_left_x(bbox), t, float(conf)))
         except Exception:
             continue
     if len(items) < 2:
         return []
+
+    # Step 1: cluster OCR tokens into horizontal rows.
     items.sort(key=lambda r: r[0])
     rows: list[list[tuple[float, float, float, str, float]]] = []
     for it in items:
@@ -468,7 +474,8 @@ def _stacked_two_line_merge(results: list) -> list[tuple[str, float]]:
         for row in rows:
             row_y = sum(r[0] for r in row) / len(row)
             row_h = max(r[1] for r in row)
-            if abs(it[0] - row_y) < max(row_h * 0.7, 6.0):
+            # Use token/row height, not frame-level constants.
+            if abs(it[0] - row_y) <= max(row_h * 1.0, it[1] * 1.0, 8.0):
                 row.append(it)
                 placed = True
                 break
@@ -476,21 +483,56 @@ def _stacked_two_line_merge(results: list) -> list[tuple[str, float]]:
             rows.append([it])
     if len(rows) < 2:
         return []
+
+    # Step 2: normalize each row text (L->R).
     rows.sort(key=lambda row: sum(r[0] for r in row) / len(row))
+    row_texts: list[tuple[str, float]] = []
+    row_yc: list[float] = []
+    row_h: list[float] = []
+    for row in rows:
+        row.sort(key=lambda r: r[2])
+        txt = "".join(r[3] for r in row)
+        conf = sum(r[4] for r in row) / max(1, len(row))
+        row_texts.append((txt, conf))
+        row_yc.append(sum(r[0] for r in row) / len(row))
+        row_h.append(max(r[1] for r in row))
+
+    # Step 3: merge adjacent rows with geometric gating.
     out: list[tuple[str, float]] = []
-    # Concat top→bottom across the first 2-3 rows.
-    for take in (2, 3):
-        if len(rows) < take:
-            continue
-        merged_text = ""
-        confs: list[float] = []
-        for row in rows[:take]:
-            row.sort(key=lambda r: r[2])  # left to right
-            merged_text += "".join(r[3] for r in row)
-            confs.extend(r[4] for r in row)
-        if 6 <= len(merged_text) <= 12 and confs:
-            out.append((merged_text, sum(confs) / len(confs)))
-    return out
+    for i in range(len(row_texts) - 1):
+        for j in range(i + 1, min(i + 3, len(row_texts))):
+            gap = abs(row_yc[j] - row_yc[i])
+            max_h = max(row_h[i], row_h[j], 1.0)
+            if gap > max_h * 4.5:
+                continue
+            a, ca = row_texts[i]
+            b, cb = row_texts[j]
+            merged = a + b
+            if 6 <= len(merged) <= 12:
+                out.append((merged, (ca + cb) / 2.0))
+
+    # Rare 3-line split: "HR" / "26BF" / "1234".
+    if len(row_texts) >= 3:
+        for i in range(len(row_texts) - 2):
+            a, ca = row_texts[i]
+            b, cb = row_texts[i + 1]
+            c, cc = row_texts[i + 2]
+            if not (a and b and c):
+                continue
+            max_h = max(row_h[i], row_h[i + 1], row_h[i + 2], 1.0)
+            if (
+                abs(row_yc[i + 1] - row_yc[i]) <= max_h * 4.5
+                and abs(row_yc[i + 2] - row_yc[i + 1]) <= max_h * 4.5
+            ):
+                merged = a + b + c
+                if 6 <= len(merged) <= 12:
+                    out.append((merged, (ca + cb + cc) / 3.0))
+
+    # Deduplicate by text, keep best confidence.
+    best: dict[str, float] = {}
+    for txt, conf in out:
+        best[txt] = max(best.get(txt, 0.0), conf)
+    return sorted(best.items(), key=lambda kv: (-len(kv[0]), -kv[1]))
 
 
 def _easyocr_read_roi(
@@ -697,6 +739,42 @@ def read_plates_sample_stack(
         _push(norm, ocr_conf, quality, source=source)
         return len(merged) > before
 
+    def _ocr_two_line_split_and_push(
+        roi_img,
+        *,
+        source: str,
+        quality: float,
+        ocr_min: float = 0.07,
+    ) -> bool:
+        """
+        Rescue path for stacked plates: OCR top and bottom halves separately,
+        then concatenate. Helps when one EasyOCR pass only reads one line.
+        """
+        if roi_img is None or getattr(roi_img, "size", 0) == 0:
+            return False
+        h, w = roi_img.shape[:2]
+        if h < 24 or w < 24:
+            return False
+        # Overlapping split to survive slight vertical misalignment.
+        split = int(h * 0.52)
+        top = roi_img[: max(1, split), :]
+        bottom = roi_img[max(0, int(h * 0.36)) :, :]
+        top_text, top_conf = _ocr_with_budget(top, ocr_min=ocr_min)
+        bot_text, bot_conf = _ocr_with_budget(bottom, ocr_min=ocr_min)
+        if not top_text or not bot_text:
+            return False
+        combined = normalize_plate_text(top_text + bot_text)
+        if len(combined) < 6:
+            return False
+        before = len(merged)
+        _push(
+            combined,
+            min(0.99, (float(top_conf) + float(bot_conf)) / 2.0),
+            quality,
+            source=f"{source}_split",
+        )
+        return len(merged) > before
+
     def _best_merged_plate_len() -> int:
         return max((len(p) for p in merged), default=0)
 
@@ -888,6 +966,13 @@ def read_plates_sample_stack(
                                             quality=max(0.45, pconf * 0.9),
                                             ocr_min=veh_ocr_min,
                                         )
+                                        if _best_merged_plate_len() < 9 and ocr_calls + 1 < OCR_BUDGET:
+                                            _ocr_two_line_split_and_push(
+                                                ext_enh,
+                                                source="veh_plate_2line",
+                                                quality=max(0.45, pconf * 0.9),
+                                                ocr_min=veh_ocr_min,
+                                            )
 
                                 # Mark the box on the overlay. Accepted (red)
                                 # if either crop produced a new plate read,
