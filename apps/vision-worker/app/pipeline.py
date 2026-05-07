@@ -909,8 +909,10 @@ def run_rtsp_loop(
                         continue
                     stale_count = 0
                     settle_sec = float(s.GATE_VEHICLE_SETTLE_SEC)
+                    min_area_frac = float(s.GATE_VEHICLE_MIN_AREA_FRAC)
+                    max_wait_sec = float(s.GATE_MAX_WAIT_SEC)
                     vboxes_pre: list[tuple[int, int, int, int]] | None = None
-                    if settle_sec > 0:
+                    if settle_sec > 0 or min_area_frac > 0:
                         vboxes_pre = _vehicle_boxes_for_route(frame)
                         if not vboxes_pre:
                             vehicle_episode_t0 = None
@@ -921,15 +923,33 @@ def run_rtsp_loop(
                             vehicle_episode_t0 = time.monotonic()
                             vehicle_settled = False
                             log.info(
-                                "camera %s gate: vehicle seen — waiting %.2fs before OCR",
-                                cid, settle_sec,
+                                "camera %s gate: vehicle seen — settle=%.2fs min_area=%.2f",
+                                cid, settle_sec, min_area_frac,
                             )
                         if not vehicle_settled:
                             elapsed = time.monotonic() - vehicle_episode_t0
-                            if elapsed < settle_sec:
-                                time.sleep(min(0.05, settle_sec - elapsed + 0.005))
+                            # Distance gate: largest vehicle bbox area / frame area.
+                            fh_, fw_ = frame.shape[:2]
+                            biggest = 0.0
+                            if vboxes_pre:
+                                for vb in vboxes_pre:
+                                    vx1, vy1, vx2, vy2 = vb
+                                    a = max(0, vx2 - vx1) * max(0, vy2 - vy1)
+                                    if a > biggest:
+                                        biggest = a
+                            area_frac = biggest / float(fh_ * fw_) if fw_ and fh_ else 0.0
+                            time_ok = elapsed >= settle_sec
+                            area_ok = (min_area_frac <= 0) or (area_frac >= min_area_frac)
+                            timeout = elapsed >= max_wait_sec
+                            if not ((time_ok and area_ok) or timeout):
+                                time.sleep(0.04)
                                 continue
                             vehicle_settled = True
+                            log.info(
+                                "camera %s gate ready: elapsed=%.2fs area_frac=%.3f%s",
+                                cid, elapsed, area_frac,
+                                " (timeout)" if timeout and not (time_ok and area_ok) else "",
+                            )
                     pending = _submit_frame(frame, captured_at, vboxes_pre=vboxes_pre)
 
                 # Step 2: wait for the in-flight plate OCR to finish.
@@ -1179,8 +1199,10 @@ def run_webcam_loop(
                         continue
                     stale_count = 0
                     settle_sec = float(s.GATE_VEHICLE_SETTLE_SEC)
+                    min_area_frac = float(s.GATE_VEHICLE_MIN_AREA_FRAC)
+                    max_wait_sec = float(s.GATE_MAX_WAIT_SEC)
                     vpre: list[tuple[int, int, int, int]] | None = None
-                    if settle_sec > 0:
+                    if settle_sec > 0 or min_area_frac > 0:
                         vpre = _vehicle_boxes_for_route(frame)
                         if not vpre:
                             vehicle_episode_t0_wc = None
@@ -1191,15 +1213,31 @@ def run_webcam_loop(
                             vehicle_episode_t0_wc = time.monotonic()
                             vehicle_settled_wc = False
                             log.info(
-                                "camera %s webcam gate: vehicle seen — waiting %.2fs before OCR",
-                                cid, settle_sec,
+                                "camera %s webcam gate: vehicle seen — settle=%.2fs min_area=%.2f",
+                                cid, settle_sec, min_area_frac,
                             )
                         if not vehicle_settled_wc:
                             elapsed = time.monotonic() - vehicle_episode_t0_wc
-                            if elapsed < settle_sec:
-                                time.sleep(min(0.05, settle_sec - elapsed + 0.005))
+                            fh_, fw_ = frame.shape[:2]
+                            biggest = 0.0
+                            for vb in vpre or []:
+                                vx1, vy1, vx2, vy2 = vb
+                                a = max(0, vx2 - vx1) * max(0, vy2 - vy1)
+                                if a > biggest:
+                                    biggest = a
+                            area_frac = biggest / float(fh_ * fw_) if fw_ and fh_ else 0.0
+                            time_ok = elapsed >= settle_sec
+                            area_ok = (min_area_frac <= 0) or (area_frac >= min_area_frac)
+                            timeout = elapsed >= max_wait_sec
+                            if not ((time_ok and area_ok) or timeout):
+                                time.sleep(0.04)
                                 continue
                             vehicle_settled_wc = True
+                            log.info(
+                                "camera %s webcam gate ready: elapsed=%.2fs area_frac=%.3f%s",
+                                cid, elapsed, area_frac,
+                                " (timeout)" if timeout and not (time_ok and area_ok) else "",
+                            )
                     pending = _submit_frame_wc(frame, captured_at, vboxes_pre=vpre)
 
                 current = pending

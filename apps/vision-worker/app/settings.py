@@ -99,10 +99,18 @@ class VisionSettings(BaseSettings):
     """How often to refresh camera list from API (URLs / active flags)."""
     PROCESS_INTERVAL_SEC: float = 0.0
     """Seconds to sleep after each processed frame. 0 = run as fast as OCR/detection allows."""
-    GATE_VEHICLE_SETTLE_SEC: float = 1.0
+    GATE_VEHICLE_SETTLE_SEC: float = 1.5
     """After a bus first appears in frame, wait this many seconds before starting plate+route OCR
     on live frames. Uses the sharpest *current* frame at deadline (grabber keeps draining RTSP backlog).
     0 = legacy behaviour (OCR immediately)."""
+    GATE_VEHICLE_MIN_AREA_FRAC: float = 0.08
+    """Minimum vehicle bbox area as fraction of frame area required before OCR runs.
+    Prevents OCR'ing the bus while it is still far from the camera (plate too small).
+    Typical school bus near the gate covers 10-25% of the frame; 0.08 = ~8%.
+    0 = no distance gate (legacy)."""
+    GATE_MAX_WAIT_SEC: float = 6.0
+    """Hard ceiling on the combined settle/distance wait — never block OCR longer than this
+    even if the bus never gets close enough to satisfy GATE_VEHICLE_MIN_AREA_FRAC."""
     OCR_POOL_WORKERS: int = 8
     """ThreadPoolExecutor size for plate+route futures. Higher overlaps more cameras / prefetch;
     GPU kernels still serialize on one device but overlap CPU decode + queue prep."""
@@ -139,9 +147,10 @@ class VisionSettings(BaseSettings):
     and rejects OCR garbage that would otherwise be 'corrected' into far-away state codes."""
     DEDUPE_SECONDS: float = 2.5
     """Min seconds between posting the same plate text again."""
-    CAMERA_COOLDOWN_SEC: float = 15.0
+    CAMERA_COOLDOWN_SEC: float = 4.0
     """After ANY plate posts from a camera, silence that camera for this many seconds.
-    Prevents the same physical car being logged 3-4 times as OCR misreads it on successive frames."""
+    Was 15s — that swallowed legitimate corrections (e.g. partial first read followed by full
+    second read 2-3s later). Per-plate dedupe handled by DEDUPE_SECONDS."""
     MIN_CONFIDENCE: float = 0.065
     """OCR score floor for ROI crops. Fullframe fallback uses an even lower floor automatically.
     Lower = more reads (some noise), higher = fewer reads (misses moving-bus plates).
