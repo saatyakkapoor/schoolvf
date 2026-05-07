@@ -4,6 +4,7 @@ import VideocamIcon from "@mui/icons-material/Videocam";
 import CameraAltIcon from "@mui/icons-material/CameraAlt";
 import TimelineIcon from "@mui/icons-material/Timeline";
 import EventIcon from "@mui/icons-material/Event";
+import AssessmentIcon from "@mui/icons-material/Assessment";
 import NotificationsIcon from "@mui/icons-material/Notifications";
 import SearchIcon from "@mui/icons-material/Search";
 import DirectionsBusIcon from "@mui/icons-material/DirectionsBus";
@@ -38,6 +39,7 @@ const navItems: { to: string; label: string; icon: React.ReactNode }[] = [
   { to: "/cameras", label: "Cameras", icon: <CameraAltIcon fontSize="small" /> },
   { to: "/trips", label: "Trips", icon: <TimelineIcon fontSize="small" /> },
   { to: "/events", label: "Events", icon: <EventIcon fontSize="small" /> },
+  { to: "/reports", label: "Reports", icon: <AssessmentIcon fontSize="small" /> },
   { to: "/alerts", label: "Alerts", icon: <NotificationsIcon fontSize="small" /> },
   { to: "/plates", label: "Plate lookup", icon: <SearchIcon fontSize="small" /> },
   { to: "/vehicles", label: "Fleet & Routes", icon: <DirectionsBusIcon fontSize="small" /> },

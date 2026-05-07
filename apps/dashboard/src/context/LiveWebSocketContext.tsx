@@ -18,7 +18,8 @@ type WsMessage =
   | { type: "snapshot"; recent: LiveDetection[]; debug?: LiveDebugEntry[] }
   | { type: "detection"; payload: LiveDetection }
   | { type: "debug"; payload: LiveDebugEntry }
-  | { type: "detection_adjusted"; event_id: string; swap_type: string; swap_notes: string | null; swap_resolved: boolean; swap_resolved_by: string };
+  | { type: "detection_adjusted"; event_id: string; swap_type: string; swap_notes: string | null; swap_resolved: boolean; swap_resolved_by: string }
+  | { type: "detection_edited"; event_id: string; row: LiveDetection };
 
 const RAW_LOG_MAX = 120;
 const DEBUG_MAX = 200;
@@ -47,6 +48,13 @@ function parseMessage(raw: string): WsMessage | null {
         swap_notes: (msg.swap_notes as string | null) ?? null,
         swap_resolved: msg.swap_resolved as boolean,
         swap_resolved_by: msg.swap_resolved_by as string,
+      };
+    }
+    if (msg.type === "detection_edited" && typeof msg.event_id === "string" && msg.row) {
+      return {
+        type: "detection_edited",
+        event_id: msg.event_id as string,
+        row: msg.row as LiveDetection,
       };
     }
   } catch {
@@ -95,6 +103,12 @@ export function LiveWebSocketProvider({ children }: { children: ReactNode }) {
             ? { ...r, swap_type: msg.swap_type, swap_notes: msg.swap_notes, swap_resolved: msg.swap_resolved, swap_resolved_by: msg.swap_resolved_by }
             : r,
         ),
+      );
+      return;
+    }
+    if (msg.type === "detection_edited") {
+      setRecent((prev) =>
+        prev.map((r) => (r.id === msg.event_id ? { ...r, ...msg.row } : r)),
       );
       return;
     }

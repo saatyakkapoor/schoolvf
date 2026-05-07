@@ -11,6 +11,7 @@ import FiberManualRecordIcon from "@mui/icons-material/FiberManualRecord";
 import SwapHorizIcon from "@mui/icons-material/SwapHoriz";
 import WarningAmberIcon from "@mui/icons-material/WarningAmber";
 import CheckCircleIcon from "@mui/icons-material/CheckCircle";
+import EditIcon from "@mui/icons-material/Edit";
 import EditNoteIcon from "@mui/icons-material/EditNote";
 import {
   Alert,
@@ -42,7 +43,7 @@ import AddIcon from "@mui/icons-material/Add";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
-import { adjustDetection, getLiveRecent, submitManualDetection } from "../api/live";
+import { adjustDetection, editDetection, getLiveRecent, submitManualDetection } from "../api/live";
 import { getVehicles } from "../api/vehicles";
 import { useLiveWebSocket } from "../hooks/useLiveWebSocket";
 import type { LiveDetection, Vehicle } from "../types";
@@ -279,6 +280,91 @@ function ManualEntryDialog({ open, onClose }: { open: boolean; onClose: () => vo
 }
 
 
+function EditDetectionDialog({
+  open,
+  row,
+  onClose,
+}: {
+  open: boolean;
+  row: LiveDetection;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const [plateText, setPlateText] = useState(row.plate_text || "");
+  const [routeNumber, setRouteNumber] = useState(row.detected_route || "");
+  const [notes, setNotes] = useState(row.notes || "");
+
+  const mut = useMutation({
+    mutationFn: () =>
+      editDetection(row.id, {
+        plate_text: plateText.trim().toUpperCase() || undefined,
+        detected_route: routeNumber.trim().toUpperCase() || undefined,
+        notes: notes.trim() || null,
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["live", "recent", 100] });
+      onClose();
+    },
+  });
+
+  return (
+    <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth>
+      <DialogTitle sx={{ pb: 0.5 }}>
+        <Stack direction="row" alignItems="center" spacing={1}>
+          <EditIcon color="primary" fontSize="small" />
+          <Typography variant="h6" component="span">Edit detection</Typography>
+        </Stack>
+        <Typography variant="caption" color="text.secondary">
+          Correct the OCR'd plate or route. The registered route mapping is re-resolved automatically.
+        </Typography>
+      </DialogTitle>
+      <DialogContent sx={{ pt: 2 }}>
+        <Stack spacing={2}>
+          <TextField
+            label="Plate number"
+            size="small"
+            value={plateText}
+            onChange={(e) => setPlateText(e.target.value.toUpperCase())}
+            placeholder="e.g. HR26BF1234"
+            fullWidth
+          />
+          <TextField
+            label="Detected route"
+            size="small"
+            value={routeNumber}
+            onChange={(e) => setRouteNumber(e.target.value.toUpperCase())}
+            placeholder="e.g. AR-29 or 29"
+            fullWidth
+          />
+          <TextField
+            label="Notes"
+            size="small"
+            multiline
+            minRows={2}
+            value={notes}
+            onChange={(e) => setNotes(e.target.value)}
+          />
+          {mut.isError && (
+            <Alert severity="error">Could not save the correction. Please retry.</Alert>
+          )}
+        </Stack>
+      </DialogContent>
+      <DialogActions sx={{ px: 3, pb: 2 }}>
+        <Button onClick={onClose} disabled={mut.isPending}>Cancel</Button>
+        <Button
+          variant="contained"
+          startIcon={mut.isPending ? <CircularProgress size={14} /> : <EditIcon />}
+          disabled={mut.isPending}
+          onClick={() => mut.mutate()}
+        >
+          Save
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+
 function DetectionRow({ row }: { row: LiveDetection }) {
   const hasRoute = row.is_registered && row.route_number;
   const isMismatch = row.is_mismatch && !row.swap_resolved;
@@ -292,6 +378,7 @@ function DetectionRow({ row }: { row: LiveDetection }) {
   // as a hint underneath, clearly labelled "registry suggests".
   const routeOnly = !row.plate_text && !!row.detected_route;
   const [adjustOpen, setAdjustOpen] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
 
   const borderColor = isMismatch
     ? "rgba(255,152,0,0.6)"
@@ -463,9 +550,19 @@ function DetectionRow({ row }: { row: LiveDetection }) {
           </Stack>
 
           <Stack direction="row" alignItems="center" spacing={0.5} mt={0.25}>
-            <Typography variant="caption" color="text.secondary" noWrap>
+            <Typography variant="caption" color="text.secondary" noWrap sx={{ flex: 1 }}>
               {row.camera_name} · <span style={{ fontFamily: "monospace", fontSize: 10 }}>{row.camera_id}</span> · {formatTime(row.detected_at)}
             </Typography>
+            <Tooltip title="Edit this detection (correct plate / route / notes)" arrow>
+              <IconButton
+                size="small"
+                onClick={() => setEditOpen(true)}
+                aria-label="Edit detection"
+                sx={{ p: 0.25, color: "text.secondary", "&:hover": { color: "primary.main" } }}
+              >
+                <EditIcon sx={{ fontSize: 14 }} />
+              </IconButton>
+            </Tooltip>
           </Stack>
 
           {/* Mismatch action buttons */}
@@ -501,6 +598,10 @@ function DetectionRow({ row }: { row: LiveDetection }) {
       <Collapse in={adjustOpen} unmountOnExit sx={{ width: "100%" }}>
         <AdjustForm row={row} onDone={() => setAdjustOpen(false)} />
       </Collapse>
+
+      {editOpen && (
+        <EditDetectionDialog open={editOpen} row={row} onClose={() => setEditOpen(false)} />
+      )}
     </ListItem>
   );
 }

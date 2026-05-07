@@ -80,6 +80,13 @@ class AdjustIn(BaseModel):
     notes: str | None = None
 
 
+class EditDetectionIn(BaseModel):
+    """Operator-driven correction of a recent detection (pencil icon on the dashboard)."""
+    plate_text: str | None = None
+    detected_route: str | None = None
+    notes: str | None = None
+
+
 class DebugIn(BaseModel):
     """Vision worker (or tools) push structured debug; shown on Live Monitor."""
 
@@ -873,7 +880,62 @@ async def adjust_detection(
     return {"status": "ok", "event_id": event_id}
 
 
-_WS_PING_INTERVAL = 20.0  # seconds between server→client ping frames
+@router.patch("/live/detections/{event_id}")
+async def edit_detection(
+    event_id: str,
+    body: EditDetectionIn,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_username),
+) -> dict[str, Any]:
+    """
+    Edit a detection in-place: correct the plate text, the detected route,
+    or attach operator notes. Updates the in-memory record and re-resolves
+    the registered route from the vehicle registry.
+    """
+    target: dict[str, Any] | None = None
+    for rec in _recent:
+        if rec.get("id") == event_id:
+            target = rec
+            break
+    if target is None:
+        raise HTTPException(status_code=404, detail="Detection not found (may have expired from buffer)")
+
+    new_plate = (body.plate_text or "").strip().upper() or None
+    new_route = _normalize_route_label(body.detected_route or "") or None
+    if new_plate is not None:
+        target["plate_text"] = new_plate
+        target["has_plate"] = True
+        # Re-resolve the registry mapping for the corrected plate.
+        veh = (
+            db.query(AppVehicle)
+            .filter(AppVehicle.plate_number == new_plate, AppVehicle.is_active.is_(True))
+            .first()
+        )
+        target["is_registered"] = veh is not None
+        target["route_number"] = (veh.route_number or "").strip().upper() if veh else ""
+        target["route_name"] = (veh.route_name or "") if veh else ""
+        target["driver_name"] = (veh.driver_name or "") if veh else ""
+        target["plate_from_storage"] = False
+        target["suggested_plate"] = ""
+    if new_route is not None:
+        target["detected_route"] = new_route
+        target["has_route"] = True
+    if body.notes is not None:
+        target["notes"] = body.notes.strip() or None
+
+    target["edited_by"] = username
+    target["edited_at"] = datetime.now(timezone.utc).isoformat()
+    # Mismatch flag may need recomputation now that plate/route may have changed.
+    reg = (target.get("route_number") or "").strip().upper()
+    det = (target.get("detected_route") or "").strip().upper()
+    target["is_mismatch"] = bool(det and reg and det != reg)
+
+    await manager.broadcast({"type": "detection_edited", "event_id": event_id, "row": target})
+    return {"status": "ok", "event_id": event_id, "row": target}
+
+
+# Lower interval = quicker dead-connection detection; client always responds with pong.
+_WS_PING_INTERVAL = 12.0  # seconds between server→client ping frames
 
 
 @router.websocket("/ws/live")

@@ -9,6 +9,7 @@ import EventsPage from "./pages/EventsPage";
 import LoginPage from "./pages/LoginPage";
 import LivePage from "./pages/LivePage";
 import PlateLookupPage from "./pages/PlateLookupPage";
+import ReportsPage from "./pages/ReportsPage";
 import TripsPage from "./pages/TripsPage";
 import VehiclesPage from "./pages/VehiclesPage";
 import UsersPage from "./pages/UsersPage";
@@ -31,6 +32,7 @@ export default function App() {
           <Route path="cameras" element={<CamerasPage />} />
           <Route path="trips" element={<TripsPage />} />
           <Route path="events" element={<EventsPage />} />
+          <Route path="reports" element={<ReportsPage />} />
           <Route path="alerts" element={<AlertsPage />} />
           <Route path="plates" element={<PlateLookupPage />} />
           <Route path="vehicles" element={<VehiclesPage />} />

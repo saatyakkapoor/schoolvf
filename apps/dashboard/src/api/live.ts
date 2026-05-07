@@ -26,6 +26,18 @@ export async function adjustDetection(
   });
 }
 
+export async function editDetection(
+  eventId: string,
+  payload: { plate_text?: string; detected_route?: string; notes?: string | null },
+): Promise<{ status: string; row: LiveDetection }> {
+  const { data } = await apiClient.patch(`/live/detections/${eventId}`, {
+    plate_text: payload.plate_text,
+    detected_route: payload.detected_route,
+    notes: payload.notes ?? null,
+  });
+  return data;
+}
+
 export async function submitManualDetection(
   payload: ManualEntryPayload,
 ): Promise<{ status: string; id: string; row: LiveDetection }> {

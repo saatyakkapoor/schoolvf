@@ -209,6 +209,9 @@ export interface LiveDetection {
   source?: "vision" | "manual" | string;
   /** Operator notes on a manual entry. */
   notes?: string | null;
+  /** Set when an operator has edited the row via the pencil icon. */
+  edited_by?: string | null;
+  edited_at?: string | null;
 }
 
 export interface ManualEntryPayload {

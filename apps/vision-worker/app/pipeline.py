@@ -618,6 +618,143 @@ def _camera_cooldown_mark(
     recent[camera_id] = (time.time(), plate)
 
 
+class _PlateVoter:
+    """Multi-frame consensus voter — accumulates OCR reads during a "vehicle visit"
+    (one bus passing the gate) and emits a single high-confidence winner.
+
+    Why this exists: a single frame's OCR is noisy. The same plate is seen 5-30
+    times during a normal pass; voting across frames trades a tiny latency for
+    a huge accuracy win.
+
+    Strategy:
+      1. Each call to `add(plate, conf, snapshot, route)` accumulates a candidate.
+      2. We score candidates with `sum(conf^2)` so a single 0.95 read beats a
+         pile of low-conf garbage. Squaring is the classic trick for this.
+      3. Character-position fallback for same-length variants:
+            HR55BC2973  (3 votes, conf 0.7 each)
+            HR58BC2973  (1 vote, 0.6) — likely OCR misread of "5" → "8"
+         char-vote merges them into HR55BC2973 (5 wins position 2 by votes).
+      4. `flush()` returns the winner only when the visit is "ripe" — either
+         max_age has elapsed or the visit ended (vehicle gone N seconds).
+    """
+
+    def __init__(self, *, min_votes: int = 2, max_age_sec: float = 2.5,
+                 visit_end_grace_sec: float = 2.0):
+        self._min_votes = max(1, int(min_votes))
+        self._max_age_sec = float(max_age_sec)
+        self._grace_sec = float(visit_end_grace_sec)
+        self._reads: list[tuple[float, str, float, str | None, str | None]] = []
+        # (timestamp, plate, conf, snapshot_b64, route)
+        self._first_t: float | None = None
+        self._last_seen_vehicle: float | None = None
+
+    def add(self, plate: str, conf: float, *, snapshot: str | None,
+            route: str | None) -> None:
+        if not plate or len(plate) < 4:
+            return
+        now = time.time()
+        if self._first_t is None:
+            self._first_t = now
+        self._reads.append((now, plate, float(conf), snapshot, route))
+
+    def mark_vehicle_seen(self) -> None:
+        self._last_seen_vehicle = time.time()
+
+    def has_data(self) -> bool:
+        return bool(self._reads)
+
+    def reset(self) -> None:
+        self._reads = []
+        self._first_t = None
+        self._last_seen_vehicle = None
+
+    def _char_vote_merge(self, candidates: list[tuple[str, float]]) -> tuple[str, float] | None:
+        """Per-character voting on same-length plates. Returns (text, conf)."""
+        if not candidates:
+            return None
+        # Bucket by length and pick the bucket with the highest summed confidence.
+        by_len: dict[int, list[tuple[str, float]]] = {}
+        for txt, c in candidates:
+            by_len.setdefault(len(txt), []).append((txt, c))
+        best_len = max(by_len, key=lambda L: sum(c for _, c in by_len[L]))
+        bucket = by_len[best_len]
+        merged = []
+        total_conf = 0.0
+        for i in range(best_len):
+            char_scores: dict[str, float] = {}
+            for txt, c in bucket:
+                ch = txt[i]
+                char_scores[ch] = char_scores.get(ch, 0.0) + (c * c)
+            best_ch = max(char_scores, key=lambda k: char_scores[k])
+            merged.append(best_ch)
+            total_conf += char_scores[best_ch]
+        if not merged:
+            return None
+        return ("".join(merged), min(0.99, total_conf / max(1, best_len)))
+
+    def _ripe(self, force: bool = False) -> bool:
+        if force:
+            return True
+        if not self._reads or self._first_t is None:
+            return False
+        elapsed = time.time() - self._first_t
+        # End-of-visit: vehicle disappeared and grace passed.
+        if (
+            self._last_seen_vehicle is not None
+            and (time.time() - self._last_seen_vehicle) >= self._grace_sec
+        ):
+            return True
+        # Bounded latency: even if vehicle is still in frame, don't wait forever.
+        if elapsed >= self._max_age_sec and len(self._reads) >= self._min_votes:
+            return True
+        return False
+
+    def flush(self, *, force: bool = False) -> tuple[str, float, str | None, str | None] | None:
+        """Return winning (plate, conf, snapshot, route) and clear state. None if not ripe."""
+        if not self._ripe(force=force):
+            return None
+        # Score candidates: sum of conf^2 per exact text.
+        scores: dict[str, float] = {}
+        snaps: dict[str, str] = {}
+        routes: dict[str, str] = {}
+        candidates: list[tuple[str, float]] = []
+        for ts, plate, conf, snap, route in self._reads:
+            scores[plate] = scores.get(plate, 0.0) + (conf * conf)
+            candidates.append((plate, conf))
+            # Keep the snapshot/route from the highest-conf read of this text.
+            if snap and (plate not in snaps or conf > scores.get(plate + "::conf", 0.0)):
+                snaps[plate] = snap
+                scores[plate + "::conf"] = conf
+            if route and plate not in routes:
+                routes[plate] = route
+
+        if not scores:
+            self.reset()
+            return None
+        # Rank exact-text candidates first. Char-merge as a refiner that can
+        # *override* if it produces a same-length winner with higher score.
+        exact = [(t, s) for t, s in scores.items() if "::conf" not in t]
+        exact.sort(key=lambda kv: kv[1], reverse=True)
+        winner_text, winner_score = exact[0]
+        winner_avg = winner_score ** 0.5  # rough mean conf
+        char_merged = self._char_vote_merge(candidates)
+        if char_merged:
+            cm_text, cm_conf = char_merged
+            cm_score = scores.get(cm_text, 0.0)
+            if cm_score >= winner_score:
+                winner_text, winner_score, winner_avg = cm_text, cm_score, cm_conf
+
+        # Best snapshot for the winner — fall back to any read's snapshot.
+        snap = snaps.get(winner_text)
+        if snap is None:
+            snap = next((r[3] for r in self._reads if r[3]), None)
+        route = routes.get(winner_text) or next((r[4] for r in self._reads if r[4]), None)
+        out = (winner_text, min(0.99, max(0.0, winner_avg)), snap, route)
+
+        self.reset()
+        return out
+
+
 def _route_only_dedupe_allow(
     route: str,
     camera_id: str,
@@ -844,6 +981,11 @@ def run_rtsp_loop(
             recent_cam: dict[str, tuple[float, str]] = {}  # per-camera cooldown tracker
             startup_deadline = time.time() + 8.0
             stale_count = 0
+            # Multi-frame plate voter: collects OCR reads across frames and emits
+            # one consensus winner per visit. Default settings tuned for ~30 fps
+            # gate cameras: 2 minimum votes, 2.5s max latency.
+            plate_voter = _PlateVoter(min_votes=2, max_age_sec=2.5,
+                                      visit_end_grace_sec=2.0)
 
             # ── Prefetch / double-buffered OCR pipeline ──────────────────────
             # While we post / jpeg-encode the *current* frame's results, the
@@ -917,6 +1059,19 @@ def run_rtsp_loop(
                         if not vboxes_pre:
                             vehicle_episode_t0 = None
                             vehicle_settled = False
+                            # Visit ended — emit consensus winner if enough reads were collected.
+                            voted_end = plate_voter.flush(force=True)
+                            if voted_end is not None:
+                                v_plate, v_conf, v_snap, v_route = voted_end
+                                if _dedupe_allow(v_plate, last, s.DEDUPE_SECONDS, v_route) \
+                                        and _camera_cooldown_allow(v_plate, cid, recent_cam, s.CAMERA_COOLDOWN_SEC):
+                                    _post_detection(
+                                        s, v_plate, v_conf, v_snap or None,
+                                        camera_id=cid, camera_name=cname,
+                                        detected_route=v_route,
+                                    )
+                                    _camera_cooldown_mark(v_plate, cid, recent_cam)
+                                    log.info("visit-end vote: %s conf=%.2f", v_plate, v_conf)
                             time.sleep(0.02)
                             continue
                         if vehicle_episode_t0 is None:
@@ -1053,11 +1208,10 @@ def run_rtsp_loop(
                     )
 
                 snap: str | None = None
-                posted_any = False
-                # Confidence floor: anything below this is treated as noise and
-                # never posted to the dashboard. The user's hard rule:
-                # "atleast 50% confidence for anything to show up on the log".
+                # Confidence floor for *individual* OCR reads going into the voter.
                 INGEST_CONF_FLOOR = float(s.INGEST_MIN_CONFIDENCE)
+                if vboxes_dbg:
+                    plate_voter.mark_vehicle_seen()
                 for plate, conf in plates:
                     if conf < INGEST_CONF_FLOOR:
                         log.info(
@@ -1065,28 +1219,38 @@ def run_rtsp_loop(
                             plate, conf, INGEST_CONF_FLOOR,
                         )
                         continue
-                    if not _dedupe_allow(plate, last, s.DEDUPE_SECONDS, route):
-                        log.debug("plate dedupe skip: %s", plate)
-                        continue
-                    if not _camera_cooldown_allow(plate, cid, recent_cam, s.CAMERA_COOLDOWN_SEC):
-                        continue
                     if snap is None:
                         snap = frame_to_jpeg_b64(annotated, s.SNAPSHOT_MAX_WIDTH)
-                    _post_detection(
-                        s, plate, conf, snap or None,
-                        camera_id=cid, camera_name=cname, detected_route=route,
-                    )
-                    _camera_cooldown_mark(plate, cid, recent_cam)
-                    posted_any = True
+                    plate_voter.add(plate, conf, snapshot=snap, route=route)
 
-                # Route-only fallback: bus visible (placard readable) but plate
-                # OCR returned nothing. Post a route-only sighting so the API
-                # can suggest a plate from the registry — dashboard renders
-                # a yellow triangle. The plate text is NOT auto-filled into
-                # the OCR result; the dashboard surfaces it as a separate
-                # "registry suggests" hint so users can tell the difference
-                # between a real read and a registry-only match.
-                if not posted_any and route:
+                # Multi-frame voting: emit ONE consensus winner per visit.
+                voted = plate_voter.flush(force=False)
+                posted_any = False
+                if voted is not None:
+                    v_plate, v_conf, v_snap, v_route = voted
+                    if _dedupe_allow(v_plate, last, s.DEDUPE_SECONDS, v_route) \
+                            and _camera_cooldown_allow(v_plate, cid, recent_cam, s.CAMERA_COOLDOWN_SEC):
+                        post_snap = v_snap or snap
+                        if post_snap is None:
+                            post_snap = frame_to_jpeg_b64(annotated, s.SNAPSHOT_MAX_WIDTH)
+                        _post_detection(
+                            s, v_plate, v_conf, post_snap or None,
+                            camera_id=cid, camera_name=cname, detected_route=v_route,
+                        )
+                        _camera_cooldown_mark(v_plate, cid, recent_cam)
+                        posted_any = True
+                        log.info(
+                            "voted plate posted: %s conf=%.2f route=%s",
+                            v_plate, v_conf, v_route or "?",
+                        )
+
+                # Route-only fallback only fires when no vehicle is actively
+                # being voted on (avoids racing with the voter).
+                if (
+                    not posted_any
+                    and route
+                    and not plate_voter.has_data()
+                ):
                     if _route_only_dedupe_allow(route, cid, last, max(s.DEDUPE_SECONDS, 6.0)):
                         if snap is None:
                             snap = frame_to_jpeg_b64(annotated, s.SNAPSHOT_MAX_WIDTH)
@@ -1153,6 +1317,8 @@ def run_webcam_loop(
             pending: dict | None = None
             vehicle_episode_t0_wc: float | None = None
             vehicle_settled_wc: bool = False
+            plate_voter_wc = _PlateVoter(min_votes=2, max_age_sec=2.5,
+                                         visit_end_grace_sec=2.0)
 
             def _submit_frame_wc(
                 _f,
@@ -1207,6 +1373,20 @@ def run_webcam_loop(
                         if not vpre:
                             vehicle_episode_t0_wc = None
                             vehicle_settled_wc = False
+                            # Vehicle gone — flush voter so we don't lose a
+                            # winner if the bus already produced enough reads.
+                            voted_end = plate_voter_wc.flush(force=True)
+                            if voted_end is not None:
+                                v_plate, v_conf, v_snap, v_route = voted_end
+                                if _dedupe_allow(v_plate, last, s.DEDUPE_SECONDS, v_route) \
+                                        and _camera_cooldown_allow(v_plate, cid, recent_cam, s.CAMERA_COOLDOWN_SEC):
+                                    _post_detection(
+                                        s, v_plate, v_conf, v_snap or None,
+                                        camera_id=cid, camera_name=cname,
+                                        detected_route=v_route,
+                                    )
+                                    _camera_cooldown_mark(v_plate, cid, recent_cam)
+                                    log.info("visit-end vote (webcam): %s conf=%.2f", v_plate, v_conf)
                             time.sleep(0.02)
                             continue
                         if vehicle_episode_t0_wc is None:
@@ -1307,8 +1487,9 @@ def run_webcam_loop(
                         },
                     )
                 snap: str | None = None
-                posted_any = False
                 INGEST_CONF_FLOOR = float(s.INGEST_MIN_CONFIDENCE)
+                if vboxes_dbg:
+                    plate_voter_wc.mark_vehicle_seen()
                 for plate, conf in plates:
                     if conf < INGEST_CONF_FLOOR:
                         log.info(
@@ -1316,16 +1497,26 @@ def run_webcam_loop(
                             plate, conf, INGEST_CONF_FLOOR,
                         )
                         continue
-                    if not _dedupe_allow(plate, last, s.DEDUPE_SECONDS, route):
-                        continue
-                    if not _camera_cooldown_allow(plate, cid, recent_cam, s.CAMERA_COOLDOWN_SEC):
-                        continue
-                    _camera_cooldown_mark(plate, cid, recent_cam)
                     if snap is None:
                         snap = frame_to_jpeg_b64(annotated, s.SNAPSHOT_MAX_WIDTH)
-                    _post_detection(s, plate, conf, snap or None, camera_id=cid, camera_name=cname,
-                                    detected_route=route)
-                    posted_any = True
+                    plate_voter_wc.add(plate, conf, snapshot=snap, route=route)
+
+                voted = plate_voter_wc.flush(force=False)
+                posted_any = False
+                if voted is not None:
+                    v_plate, v_conf, v_snap, v_route = voted
+                    if _dedupe_allow(v_plate, last, s.DEDUPE_SECONDS, v_route) \
+                            and _camera_cooldown_allow(v_plate, cid, recent_cam, s.CAMERA_COOLDOWN_SEC):
+                        post_snap = v_snap or snap
+                        if post_snap is None:
+                            post_snap = frame_to_jpeg_b64(annotated, s.SNAPSHOT_MAX_WIDTH)
+                        _post_detection(
+                            s, v_plate, v_conf, post_snap or None,
+                            camera_id=cid, camera_name=cname, detected_route=v_route,
+                        )
+                        _camera_cooldown_mark(v_plate, cid, recent_cam)
+                        posted_any = True
+                        log.info("voted plate (webcam): %s conf=%.2f", v_plate, v_conf)
 
                 # Route-only fallback (webcam path) — see RTSP loop for the rationale.
                 if not posted_any and route:
