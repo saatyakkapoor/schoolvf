@@ -33,10 +33,16 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Force a flushed line so the user sees us alive even if Docker is slow.
+Write-Host "[start-all.ps1] starting…" -ForegroundColor Cyan
+Write-Host ("[start-all.ps1] PowerShell {0} on {1}" -f $PSVersionTable.PSVersion, [System.Environment]::OSVersion.VersionString)
+
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root        = Resolve-Path (Join-Path $ScriptDir '..\..')
 $ComposeDir  = Join-Path $Root 'infra\docker'
 $ComposeFile = Join-Path $ComposeDir 'docker-compose.yml'
+Write-Host "[start-all.ps1] repo root: $Root"
+Write-Host "[start-all.ps1] compose file: $ComposeFile"
 
 if (-not (Test-Path $ComposeFile)) {
     Write-Error "docker-compose.yml not found at $ComposeFile"
@@ -59,11 +65,18 @@ function Invoke-Compose {
 }
 
 # --- Sanity: Docker daemon reachable? ---------------------------------
-& docker info *> $null
+Write-Host "[start-all.ps1] checking Docker daemon (this can take a few seconds)…" -ForegroundColor Cyan
+try {
+    & docker info *> $null
+} catch {
+    Write-Error "Docker CLI not found on PATH. Install Docker Desktop, then re-run."
+    exit 1
+}
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Docker does not appear to be running. Start Docker Desktop and retry."
     exit 1
 }
+Write-Host "[start-all.ps1] Docker is up." -ForegroundColor Green
 
 # --- Detect the host LAN IP ------------------------------------------
 function Get-PrimaryLanIp {
