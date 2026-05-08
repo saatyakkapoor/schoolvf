@@ -266,7 +266,14 @@ def _read_route_number(
         # All passes append into this list and we pick the highest-score
         # winner at the end. Each pass is deliberately CHEAP: small ROI,
         # one OCR call, strict regex via _ocr_scan_for_route.
+        # `_EARLY_EXIT_SCORE` short-circuits the cascade as soon as any pass
+        # produces a high-confidence match — saves 2 OCR calls per frame
+        # in the common case where the placard is in the most-likely band.
         candidates: list[tuple[str, float, str]] = []  # (route, score, source)
+        _EARLY_EXIT_SCORE = 1500.0  # ~AR-XX read at 0.85 conf in a 50×80 px placard
+
+        def _early_exit() -> bool:
+            return any(c[1] >= _EARLY_EXIT_SCORE for c in candidates)
 
         def _try_pass(label: str, x1: int, y1: int, x2: int, y2: int,
                       *, upscale: float = 2.5, sharpen: float = 1.45,
@@ -362,12 +369,14 @@ def _read_route_number(
         _try_pass("front_top",
                   ux1, uy1, ux2, uy1 + int(vh * 0.25),
                   upscale=2.5, sharpen=1.5, allow_bare_for_pass=False)
-        _try_pass("windshield",
-                  ux1, uy1 + int(vh * 0.10), ux2, uy1 + int(vh * 0.48),
-                  upscale=2.0, sharpen=1.35, allow_bare_for_pass=False)
-        _try_pass("front_grille",
-                  ux1, uy1 + int(vh * 0.30), ux2, uy1 + int(vh * 0.62),
-                  upscale=2.0, sharpen=1.35, allow_bare_for_pass=False)
+        if not _early_exit():
+            _try_pass("windshield",
+                      ux1, uy1 + int(vh * 0.10), ux2, uy1 + int(vh * 0.48),
+                      upscale=2.0, sharpen=1.35, allow_bare_for_pass=False)
+        if not _early_exit():
+            _try_pass("front_grille",
+                      ux1, uy1 + int(vh * 0.30), ux2, uy1 + int(vh * 0.62),
+                      upscale=2.0, sharpen=1.35, allow_bare_for_pass=False)
 
         # Pick the highest-scoring candidate across all passes.
         if candidates:
@@ -1295,6 +1304,20 @@ def run_rtsp_loop(
             vehicle_episode_t0: float | None = None
             vehicle_settled: bool = False
 
+            # ── Per-visit route cache ─────────────────────────────────────────
+            # Once we've identified a route for the current bus visit, we
+            # don't need to OCR the placard 30 more times. We cache the
+            # winning route string until the vehicle leaves the gate; this
+            # is the single biggest live-mode speedup since route OCR is
+            # responsible for ~3 OCR forward passes per frame.
+            route_cache: dict[str, Any] = {"value": None}
+            # Heavy route OCR every Nth frame even when the cache is empty —
+            # the placard may not be readable in every frame (motion blur,
+            # angle), so retrying every frame is wasteful. Voter still sees
+            # plates every frame; only route OCR is throttled.
+            _ROUTE_OCR_EVERY = 2
+            route_ocr_frame_n = {"counter": 0}
+
             def _submit_frame(
                 _f,
                 _captured_at: float,
@@ -1310,6 +1333,20 @@ def run_rtsp_loop(
                     if vboxes_pre is not None
                     else _vehicle_boxes_for_route(_f)
                 )
+                # Skip the heavy route OCR when (a) we already have a route
+                # for this visit, or (b) we ran it on a recent frame and
+                # are within the throttle window. The cached value is fed
+                # back to the post path verbatim.
+                cached_route = route_cache.get("value")
+                route_ocr_frame_n["counter"] = (route_ocr_frame_n["counter"] + 1) % _ROUTE_OCR_EVERY
+                run_route = (cached_route is None) and (route_ocr_frame_n["counter"] == 0 or vboxes)
+                if cached_route is not None:
+                    route_fut = _pool.submit(lambda: (cached_route, None))
+                elif run_route:
+                    route_fut = _pool.submit(_read_route_number, _f_copy, vboxes)
+                else:
+                    # Throttle hit — return None for this frame's route.
+                    route_fut = _pool.submit(lambda: (None, None))
                 return {
                     "frame": _f,
                     "frame_copy": _f_copy,
@@ -1324,7 +1361,7 @@ def run_rtsp_loop(
                         detection_mode=s.PLATE_DETECTION_MODE.strip().lower(),
                         vision_stack=s.VISION_STACK,
                     ),
-                    "route_fut": _pool.submit(_read_route_number, _f_copy, vboxes),
+                    "route_fut": route_fut,
                 }
 
             while True:
@@ -1439,6 +1476,16 @@ def run_rtsp_loop(
                     route, placard_bbox = _route_fut.result(timeout=1.0)
                 except Exception as _re:
                     log.debug("route OCR timeout/error: %s", _re)
+                # Lock the route for this visit. Subsequent frames skip the
+                # heavy 3-pass cascade and reuse this string.
+                if route and route_cache.get("value") is None:
+                    route_cache["value"] = route
+                    log.info("route locked for visit on cam %s: %s", cid, route)
+                # Clear the lock when no vehicles are present for this frame
+                # AND we already have a previous lock — that means the bus
+                # left the gate and the next arrival should re-OCR.
+                if not current.get("vehicle_boxes") and route_cache.get("value"):
+                    route_cache["value"] = None
                 ocr_ms = int((time.time() - t_ocr) * 1000)
                 # ─────────────────────────────────────────────────────────────
 
@@ -1627,6 +1674,10 @@ def run_webcam_loop(
             vehicle_settled_wc: bool = False
             plate_voter_wc = _PlateVoter(min_votes=2, max_age_sec=2.5,
                                          visit_end_grace_sec=2.0)
+            # Per-visit route cache (see RTSP loop for rationale).
+            route_cache_wc: dict[str, Any] = {"value": None}
+            _ROUTE_OCR_EVERY_WC = 2
+            route_ocr_frame_n_wc = {"counter": 0}
 
             def _submit_frame_wc(
                 _f,
@@ -1640,6 +1691,19 @@ def run_webcam_loop(
                     if vboxes_pre is not None
                     else _vehicle_boxes_for_route(_f)
                 )
+                cached_route = route_cache_wc.get("value")
+                route_ocr_frame_n_wc["counter"] = (
+                    route_ocr_frame_n_wc["counter"] + 1
+                ) % _ROUTE_OCR_EVERY_WC
+                run_route = (cached_route is None) and (
+                    route_ocr_frame_n_wc["counter"] == 0 or vboxes
+                )
+                if cached_route is not None:
+                    route_fut_wc = _pool.submit(lambda: (cached_route, None))
+                elif run_route:
+                    route_fut_wc = _pool.submit(_read_route_number, _f_copy, vboxes)
+                else:
+                    route_fut_wc = _pool.submit(lambda: (None, None))
                 return {
                     "frame": _f,
                     "frame_copy": _f_copy,
@@ -1654,7 +1718,7 @@ def run_webcam_loop(
                         detection_mode=s.PLATE_DETECTION_MODE.strip().lower(),
                         vision_stack=s.VISION_STACK,
                     ),
-                    "route_fut": _pool.submit(_read_route_number, _f_copy, vboxes),
+                    "route_fut": route_fut_wc,
                 }
 
             while True:
@@ -1757,6 +1821,11 @@ def run_webcam_loop(
                     route, placard_bbox = _route_fut.result(timeout=1.0)
                 except Exception as _re:
                     log.debug("route OCR timeout/error: %s", _re)
+                if route and route_cache_wc.get("value") is None:
+                    route_cache_wc["value"] = route
+                    log.info("route locked for visit on cam %s: %s", cid, route)
+                if not current.get("vehicle_boxes") and route_cache_wc.get("value"):
+                    route_cache_wc["value"] = None
                 ocr_ms = int((time.time() - t_ocr) * 1000)
                 # ─────────────────────────────────────────────────────────────
 
