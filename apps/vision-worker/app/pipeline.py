@@ -241,33 +241,93 @@ def _read_route_number(
         placard_bbox: tuple | None = None
 
         # ------------------------------------------------------------------ #
-        # Pass 1: yellow mask RESTRICTED to bus_mask                         #
+        # Yellow-bus detection: when the bus body itself is yellow (e.g.
+        # all Aravali school buses), the HSV mask covers the entire body
+        # and the placard contour gets fused with the body or skipped by
+        # the size cap. We detect this case by measuring how much of the
+        # bus crop is yellow — anything > 35% is "yellow-body" and we
+        # disable the bare-number fallback for the yellow-mask pass to
+        # prevent stickers / paint markings from masquerading as routes.
         # ------------------------------------------------------------------ #
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        yellow_mask = cv2.inRange(hsv, _YELLOW_HSV_LO, _YELLOW_HSV_HI)
+        yellow_mask_full = cv2.inRange(hsv, _YELLOW_HSV_LO, _YELLOW_HSV_HI)
+        yellow_inside_bus = cv2.bitwise_and(yellow_mask_full, bus_mask)
+        bus_area = float(np.count_nonzero(bus_mask)) or 1.0
+        yellow_frac = float(np.count_nonzero(yellow_inside_bus)) / bus_area
+        is_yellow_body = yellow_frac > 0.35
+        # On yellow-body buses the placard is identified by the AR-XX
+        # text only, never by being "the yellow rectangle". Bare numbers
+        # are too false-prone (every "5", "12", or sticker digit becomes
+        # a route).
+        allow_bare = not is_yellow_body
+        if is_yellow_body:
+            log.debug("route OCR: yellow-body bus (yellow_frac=%.2f) — strict AR-XX only", yellow_frac)
+
+        # All passes append into this list and we pick the highest-score
+        # winner at the end. Each pass is deliberately CHEAP: small ROI,
+        # one OCR call, strict regex via _ocr_scan_for_route.
+        candidates: list[tuple[str, float, str]] = []  # (route, score, source)
+
+        def _try_pass(label: str, x1: int, y1: int, x2: int, y2: int,
+                      *, upscale: float = 2.5, sharpen: float = 1.45,
+                      allow_bare_for_pass: bool = False) -> None:
+            x1c = max(0, int(x1)); y1c = max(0, int(y1))
+            x2c = min(w, int(x2)); y2c = min(h, int(y2))
+            if x2c - x1c < 12 or y2c - y1c < 8:
+                return
+            roi = frame[y1c:y2c, x1c:x2c]
+            if roi.size == 0:
+                return
+            try:
+                if upscale and upscale > 1.0:
+                    roi = cv2.resize(
+                        roi,
+                        (int(roi.shape[1] * upscale), int(roi.shape[0] * upscale)),
+                        interpolation=cv2.INTER_LANCZOS4,
+                    )
+                if sharpen and sharpen > 0:
+                    roi = _sharpen_roi(roi, strength=float(sharpen))
+                result, _ = ocr(roi)
+            except Exception as exc:
+                log.debug("route OCR pass %s failed: %s", label, exc)
+                return
+            if not result:
+                return
+            r, a = _ocr_scan_for_route(result, label, allow_bare_number=allow_bare_for_pass)
+            if r and a > 0:
+                candidates.append((r, a, label))
+            # Maintain the placard_bbox using the most-confident pass that hit.
+            nonlocal placard_bbox
+            if r and a > 0 and (placard_bbox is None or a > placard_bbox[4]):
+                try:
+                    pconf = max(float(l[2]) for l in result if len(l) >= 3)
+                except (ValueError, IndexError):
+                    pconf = 0.0
+                placard_bbox = (x1c, y1c, x2c, y2c, pconf)
+
+        # ------------------------------------------------------------------ #
+        # Pass A: yellow-contour ROI (only when the bus body ISN'T yellow,
+        # otherwise the contour is the whole bus and the OCR finds nothing
+        # useful). Uses strict AR-XX regex on yellow-body buses.
+        # ------------------------------------------------------------------ #
         k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 6))
         k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
-        yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_CLOSE, k_close)
+        yellow_mask = cv2.morphologyEx(yellow_inside_bus, cv2.MORPH_CLOSE, k_close)
         yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_OPEN, k_open)
-        yellow_mask = cv2.bitwise_and(yellow_mask, bus_mask)
-
         contours, _ = cv2.findContours(yellow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
+        if contours and not is_yellow_body:
             best_cnt: tuple[int, int, int, int] | None = None
             best_cnt_score = 0.0
             for cnt in contours:
                 cx, cy_box, cw, ch = cv2.boundingRect(cnt)
                 area = cw * ch
                 ar = cw / max(ch, 1)
-                # Size relative to the *bus union*, not the whole frame — fixes
-                # tiny frame-fraction thresholds when the bus is small/distant.
                 area_frac = area / union_area
                 if area_frac < 0.0008 or area_frac > 0.45:
                     continue
                 if ar < 1.2 or ar > 12.0:
                     continue
                 centre_y = cy_box + ch / 2.0
-                # Upper ~70 % of the bus box = windshield / LED, not bumper plate
                 rel_y = (centre_y - uy1) / max(uy2 - uy1, 1)
                 if rel_y < 0.04 or rel_y > 0.72:
                     continue
@@ -276,66 +336,47 @@ def _read_route_number(
                 if score > best_cnt_score:
                     best_cnt_score = score
                     best_cnt = (cx, cy_box, cw, ch)
-
             if best_cnt is not None:
                 bx, by, bw, bh = best_cnt
                 pad_x = max(6, int(bw * 0.10))
                 pad_y = max(4, int(bh * 0.20))
-                x1 = max(0, bx - pad_x)
-                y1 = max(0, by - pad_y)
-                x2 = min(w, bx + bw + pad_x)
-                y2 = min(h, by + bh + pad_y)
-                roi = frame[y1:y2, x1:x2]
-                roi = cv2.resize(
-                    roi,
-                    (roi.shape[1] * 3, roi.shape[0] * 3),
-                    interpolation=cv2.INTER_LANCZOS4,
+                _try_pass(
+                    "yellow_mask",
+                    bx - pad_x, by - pad_y, bx + bw + pad_x, by + bh + pad_y,
+                    upscale=3.0, sharpen=1.8,
+                    allow_bare_for_pass=allow_bare,
                 )
-                roi = _sharpen_roi(roi, strength=1.8)
-                result, _ = ocr(roi)
-                if result:
-                    r, a = _ocr_scan_for_route(result, "yellow_mask", allow_bare_number=True)
-                    if r and a > best_area:
-                        best_area = a
-                        best_route = r
-                    texts = [
-                        (str(l[1]).strip(), round(float(l[2]), 3))
-                        for l in result
-                        if len(l) >= 3
-                    ]
-                    log.info("route yellow_mask OCR: match=%s texts=%s", r, texts[:10])
-                placard_conf = 0.0
-                if result:
-                    try:
-                        placard_conf = max(float(l[2]) for l in result if len(l) >= 3)
-                    except ValueError:
-                        placard_conf = 0.0
-                placard_bbox = (x1, y1, x2, y2, placard_conf)
 
         # ------------------------------------------------------------------ #
-        # Pass 2: windshield band ONLY within the vehicle union (not full width)
+        # Pass B-D: windshield / front-strip bands.
+        # The placard sits in one of three places on Aravali school buses:
+        #   B. above the windshield (LED display strip)        — top 0-25% of bus
+        #   C. inside the windshield (driver-side card)         — top 12-45% of bus
+        #   D. front of the body, above the bumper grille       — top 30-60% of bus
+        # We OCR all three so a placard mounted in ANY of these works.
+        # The strict AR-XX regex (allow_bare_number=False here) prevents
+        # body stickers ("ARAVALI SCHOOL", "ON DUTY", "BUS NO. 5") from
+        # matching.
         # ------------------------------------------------------------------ #
-        if not best_route:
-            vh = uy2 - uy1
-            wy1 = uy1 + int(vh * 0.02)
-            wy2 = uy1 + int(vh * 0.58)
-            roi = frame[wy1:wy2, ux1:ux2].copy()
-            if roi.size > 0:
-                roi = cv2.resize(
-                    roi,
-                    (roi.shape[1] * 2, roi.shape[0] * 2),
-                    interpolation=cv2.INTER_LANCZOS4,
-                )
-                roi = _sharpen_roi(roi, strength=1.35)
-                result, _ = ocr(roi)
-                if result:
-                    r, a = _ocr_scan_for_route(result, "windshield_bus")
-                    if r and a > best_area:
-                        best_area = a
-                        best_route = r
+        vh = uy2 - uy1
+        _try_pass("front_top",
+                  ux1, uy1, ux2, uy1 + int(vh * 0.25),
+                  upscale=2.5, sharpen=1.5, allow_bare_for_pass=False)
+        _try_pass("windshield",
+                  ux1, uy1 + int(vh * 0.10), ux2, uy1 + int(vh * 0.48),
+                  upscale=2.0, sharpen=1.35, allow_bare_for_pass=False)
+        _try_pass("front_grille",
+                  ux1, uy1 + int(vh * 0.30), ux2, uy1 + int(vh * 0.62),
+                  upscale=2.0, sharpen=1.35, allow_bare_for_pass=False)
 
-        if best_route:
-            log.info("route OCR winner: %s  score=%.0f (bus-gated)", best_route, best_area)
+        # Pick the highest-scoring candidate across all passes.
+        if candidates:
+            candidates.sort(key=lambda c: c[1], reverse=True)
+            best_route, best_area, src = candidates[0]
+            log.info(
+                "route OCR winner: %s score=%.0f source=%s (yellow_body=%s, %d passes hit)",
+                best_route, best_area, src, is_yellow_body, len(candidates),
+            )
         return best_route, placard_bbox
     except Exception as exc:
         log.warning("route OCR exception: %s", exc)
