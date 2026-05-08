@@ -441,19 +441,47 @@ function DetectionRow({ row }: { row: LiveDetection }) {
               </Tooltip>
             )}
             {row.plate_text ? (
-              <Typography
-                variant="body2" fontWeight={700} fontFamily="monospace"
-                sx={{
-                  letterSpacing: 1.5,
-                  color: isMismatch
-                    ? "warning.main"
-                    : hasRoute
-                    ? "#FFD700"
-                    : "text.primary",
-                }}
-              >
-                {row.plate_text}
-              </Typography>
+              <Stack direction="row" alignItems="center" spacing={0.75}>
+                <Typography
+                  variant="body2" fontWeight={700} fontFamily="monospace"
+                  sx={{
+                    letterSpacing: 1.5,
+                    color: isMismatch
+                      ? "warning.main"
+                      : hasRoute
+                      ? "#FFD700"
+                      : "text.primary",
+                  }}
+                >
+                  {row.plate_text}
+                </Typography>
+                {row.plate_corrected_from_route && (
+                  <Tooltip
+                    title={
+                      row.plate_text_raw
+                        ? `Rounded off — OCR read "${row.plate_text_raw}", matched route ${row.detected_route || "?"} → registry plate ${row.plate_text}.`
+                        : `Plate rounded to registered value via route lookup.`
+                    }
+                    arrow
+                  >
+                    <Chip
+                      label={`ROUNDED${row.plate_text_raw ? ` · ${row.plate_text_raw}` : ""}`}
+                      size="small"
+                      variant="outlined"
+                      sx={{
+                        height: 18,
+                        fontSize: 9,
+                        fontWeight: 700,
+                        letterSpacing: 0.5,
+                        color: "#7CDCC1",
+                        borderColor: "rgba(124,220,193,0.5)",
+                        bgcolor: "rgba(124,220,193,0.06)",
+                        "& .MuiChip-label": { px: 0.75 },
+                      }}
+                    />
+                  </Tooltip>
+                )}
+              </Stack>
             ) : (
               <Stack direction="column" spacing={0.25}>
                 <Tooltip

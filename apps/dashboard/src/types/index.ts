@@ -212,6 +212,13 @@ export interface LiveDetection {
   /** Set when an operator has edited the row via the pencil icon. */
   edited_by?: string | null;
   edited_at?: string | null;
+  /**
+   * True when the API rounded a noisy OCR'd plate to the registered
+   * plate for the detected route (≥4 char match OR edit distance ≤ 3).
+   * Original OCR text lives in `plate_text_raw`.
+   */
+  plate_corrected_from_route?: boolean;
+  plate_text_raw?: string;
 }
 
 export interface ManualEntryPayload {

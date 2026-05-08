@@ -111,9 +111,10 @@ class VisionSettings(BaseSettings):
     GATE_MAX_WAIT_SEC: float = 6.0
     """Hard ceiling on the combined settle/distance wait — never block OCR longer than this
     even if the bus never gets close enough to satisfy GATE_VEHICLE_MIN_AREA_FRAC."""
-    OCR_POOL_WORKERS: int = 8
+    OCR_POOL_WORKERS: int = 12
     """ThreadPoolExecutor size for plate+route futures. Higher overlaps more cameras / prefetch;
-    GPU kernels still serialize on one device but overlap CPU decode + queue prep."""
+    GPU kernels still serialize on one device but overlap CPU decode + queue prep.
+    Bumped 8 → 12 to keep the GPU busy while CPU does pre/post-processing."""
     RTSP_GRAB_DRAIN: int = 1
     """grab() this many times before retrieve(); 1 = lowest latency, higher = stabler but slower."""
     HTTP_POST_WORKERS: int = 16
@@ -168,11 +169,14 @@ class VisionSettings(BaseSettings):
     taller crop includes grille / high-mounted plates; max ~0.5). Was hardcoded 0.45."""
     PLATE_YOLO_MIN_CONF: float = 0.06
     """Min confidence for license_plate_detector.pt inside the bumper ROI (lower = more boxes, more OCR)."""
-    PLATE_OCR_BUDGET: int = 10
-    """Max EasyOCR forward passes per frame in the sample stack (tight + 2-line crops count separately)."""
-    PLATE_OCR_TARGET_MIN_WIDTH: int = 720
+    PLATE_OCR_BUDGET: int = 16
+    """Max EasyOCR forward passes per frame in the sample stack (tight + 2-line crops count separately).
+    Bumped 10 → 16: with the multi-frame voter the extra passes get squashed
+    into one consensus winner, so the only cost is GPU time we weren't using."""
+    PLATE_OCR_TARGET_MIN_WIDTH: int = 960
     """Upscale each plate ROI to at least this width before EasyOCR. Higher =
-    more GPU RAM + time but materially better character accuracy on sharp feeds."""
+    more GPU RAM + time but materially better character accuracy on sharp feeds.
+    Bumped 720 → 960 to push more pixels through the OCR network."""
     SNAPSHOT_MAX_WIDTH: int = 960
     """Max width in px for the dashboard snapshot. 520 was destroying plate
     legibility — at typical capture distance a plate is ~60 px wide and

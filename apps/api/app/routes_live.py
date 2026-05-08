@@ -304,6 +304,49 @@ def _normalize_route_label(raw: str) -> str:
     return cleaned
 
 
+def _plate_levenshtein(a: str, b: str) -> int:
+    """Edit distance between two plate strings (uppercase, no whitespace)."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        curr = [i]
+        for j, cb in enumerate(b, 1):
+            curr.append(min(prev[j] + 1, curr[j - 1] + 1,
+                            prev[j - 1] + (0 if ca == cb else 1)))
+        prev = curr
+    return prev[-1]
+
+
+def _plates_are_close(a: str, b: str) -> tuple[bool, int, int]:
+    """
+    Decide whether OCR plate `a` is "the same physical plate" as registered `b`.
+
+    Returns (is_close, matching_chars_at_same_position, edit_distance).
+
+    User rule: if any 4+ characters line up at the same position OR the
+    edit distance is ≤ 3, treat them as the same plate and snap to the
+    registered version (the "rounded off" path).
+    """
+    if not a or not b:
+        return (False, 0, max(len(a), len(b)))
+    A = a.strip().upper()
+    B = b.strip().upper()
+    # Position-aligned character matches over the longer length.
+    n = max(len(A), len(B))
+    matches = sum(1 for i in range(min(len(A), len(B))) if A[i] == B[i])
+    dist = _plate_levenshtein(A, B)
+    # A plate is "close" if either rule fires. The 4-char threshold matches
+    # the user's stated rule; edit-distance ≤ 3 catches off-by-one shifts
+    # (e.g. extra/missing space, swapped digits) that position-match misses.
+    is_close = (matches >= 4) or (dist <= 3 and dist < max(2, n // 2))
+    return (is_close, matches, dist)
+
+
 def _find_vehicle_by_route(db: Session, route_number: str) -> AppVehicle | None:
     """
     Look up an active vehicle by route number. The vehicle table can have multiple
@@ -574,6 +617,8 @@ def _build_detection_row(
     # surfaces the suggestion in a separate field.
     suggested_plate: str | None = None
     plate_from_storage = False
+    plate_corrected_from_route = False
+    plate_text_raw: str | None = None
     vehicle: AppVehicle | None = None
 
     if plate_clean:
@@ -583,6 +628,25 @@ def _build_detection_row(
             .filter(AppVehicle.plate_number == plate_clean, AppVehicle.is_active.is_(True))
             .first()
         )
+        # ── Snap-to-registry ───────────────────────────────────────────
+        # Exact match in the registry is rare in practice — OCR almost
+        # always misses one or two characters. When the camera also saw
+        # the route placard, we can use the route to look up the vehicle
+        # and ask: "is the OCR'd plate close enough to that vehicle's
+        # registered plate?" If yes (≥4 chars line up OR edit dist ≤ 3),
+        # we trust the route + registry pair and "round off" the plate
+        # to the registered version. The original OCR text is preserved
+        # in `plate_text_raw` so the dashboard can show "ROUNDED FROM
+        # XR55BC2D7A".
+        if vehicle is None and detected_route_norm:
+            route_vehicle = _find_vehicle_by_route(db, detected_route_norm)
+            if route_vehicle is not None and route_vehicle.plate_number:
+                close, matches, dist = _plates_are_close(plate_clean, route_vehicle.plate_number)
+                if close:
+                    plate_text_raw = plate_clean
+                    plate_clean = route_vehicle.plate_number.strip().upper()
+                    vehicle = route_vehicle
+                    plate_corrected_from_route = True
     elif detected_route_norm:
         # Path 3: route placard visible but plate not readable. Look up the
         # registry to surface a suggestion, but DO NOT promote it into
@@ -633,6 +697,11 @@ def _build_detection_row(
         "has_route": bool(detected_route_norm),
         "source": source,
         "notes": notes,
+        # Set when the OCR'd plate was rounded to the registered plate
+        # because the route placard matched and the OCR text was within
+        # the similarity threshold. UI shows "ROUNDED ↻ <raw>".
+        "plate_corrected_from_route": plate_corrected_from_route,
+        "plate_text_raw": plate_text_raw or "",
     }
 
 
