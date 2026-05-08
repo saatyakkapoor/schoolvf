@@ -888,6 +888,255 @@ def _post_detection_sync(
         log.warning("Ingest failed: %s", e)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Background plate enhancer
+# ─────────────────────────────────────────────────────────────────────────────
+# When the live OCR loop posts a route-only detection (we saw the bus + the
+# placard but no plate), we save the snapshot and kick off a deep retry on a
+# background thread pool. The retry runs *heavier* OCR variants — CLAHE,
+# upscaled to 2.5x and 3.5x, sharpened — that we don't run live because
+# they're too slow per frame. If the deep pass finds a plate that matches
+# the registry's plate-for-this-route (≥4 chars positional or edit-distance ≤ 3),
+# we POST a corrected detection. The user sees the original route-only row
+# get joined by a confident plate row a second or two later.
+_DEEP_OCR_POOL: ThreadPoolExecutor | None = None
+_DEEP_OCR_LOCK = threading.Lock()
+# Per-(camera, route) suppression so we don't enhance the same bus 20 times.
+_DEEP_OCR_RECENT: dict[str, float] = {}
+_DEEP_OCR_WINDOW_SEC = 8.0
+
+
+def _get_deep_ocr_pool() -> ThreadPoolExecutor:
+    global _DEEP_OCR_POOL
+    if _DEEP_OCR_POOL is None:
+        with _DEEP_OCR_LOCK:
+            if _DEEP_OCR_POOL is None:
+                _DEEP_OCR_POOL = ThreadPoolExecutor(
+                    max_workers=2, thread_name_prefix="deep-ocr",
+                )
+    return _DEEP_OCR_POOL
+
+
+def _deep_ocr_dedupe_allow(camera_id: str, route: str | None) -> bool:
+    key = f"{camera_id}::{route or '?'}"
+    now = time.time()
+    prev = _DEEP_OCR_RECENT.get(key)
+    if prev is not None and now - prev < _DEEP_OCR_WINDOW_SEC:
+        return False
+    _DEEP_OCR_RECENT[key] = now
+    return True
+
+
+def _plates_close_enough(a: str, b: str) -> bool:
+    """Same rule as the API's snap-to-registry: ≥4 char position match OR edit dist ≤ 3."""
+    if not a or not b:
+        return False
+    A, B = a.upper(), b.upper()
+    matches = sum(1 for i in range(min(len(A), len(B))) if A[i] == B[i])
+    if matches >= 4:
+        return True
+    # Cheap inline edit distance.
+    if A == B:
+        return True
+    if abs(len(A) - len(B)) > 3:
+        return False
+    prev = list(range(len(B) + 1))
+    for i, ca in enumerate(A, 1):
+        curr = [i]
+        for j, cb in enumerate(B, 1):
+            curr.append(min(prev[j] + 1, curr[j - 1] + 1,
+                            prev[j - 1] + (0 if ca == cb else 1)))
+        prev = curr
+    return prev[-1] <= 3
+
+
+def _enhance_variants(frame: "np.ndarray") -> list["np.ndarray"]:
+    """Cheap-to-medium image enhancements for the deep retry. Each variant
+    is fed to `read_plates_from_frame` independently.
+
+    Order matters: variants with the highest expected lift come first so
+    we can short-circuit on a registry match.
+    """
+    out: list[np.ndarray] = [frame]
+    h, w = frame.shape[:2]
+    try:
+        # Variant 1: CLAHE on the L channel — boosts plate-on-bus-body contrast
+        # without saturating colours.
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l_, a_, b_ = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        l_eq = clahe.apply(l_)
+        out.append(cv2.cvtColor(cv2.merge((l_eq, a_, b_)), cv2.COLOR_LAB2BGR))
+    except Exception:
+        pass
+    try:
+        # Variant 2: 1.5× upscale + sharpen — lets EasyOCR's small-text
+        # branch recover characters smudged at native resolution.
+        big = cv2.resize(frame, (int(w * 1.5), int(h * 1.5)),
+                         interpolation=cv2.INTER_LANCZOS4)
+        kernel = np.array([[0, -1, 0], [-1, 5.2, -1], [0, -1, 0]], dtype=np.float32)
+        out.append(cv2.filter2D(big, -1, kernel))
+    except Exception:
+        pass
+    try:
+        # Variant 3: bilateral denoise — kills the JPEG mosquito noise
+        # around the plate edges that confuses character segmentation.
+        out.append(cv2.bilateralFilter(frame, d=5, sigmaColor=60, sigmaSpace=60))
+    except Exception:
+        pass
+    return out
+
+
+def _deep_ocr_worker(
+    api_base: str,
+    secret: str,
+    snapshot_jpeg_bytes: bytes,
+    camera_id: str,
+    camera_name: str,
+    route: str | None,
+    expected_plate: str | None,
+    min_confidence: float,
+    strict_indian: bool,
+    detection_mode: str,
+    vision_stack: str,
+) -> None:
+    """Run heavier OCR variants on a saved snapshot. POSTs a corrected
+    detection when a plate emerges that matches the registry's expectation."""
+    try:
+        arr = np.frombuffer(snapshot_jpeg_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            log.warning("deep-ocr: failed to decode snapshot for camera %s", camera_id)
+            return
+    except Exception as exc:
+        log.warning("deep-ocr: snapshot decode error: %s", exc)
+        return
+
+    candidates: list[tuple[str, float]] = []
+    matched: tuple[str, float] | None = None
+    for i, variant in enumerate(_enhance_variants(frame)):
+        try:
+            plates, _boxes = read_plates_from_frame(
+                variant,
+                min_confidence=min_confidence,
+                strict_indian=strict_indian,
+                detection_mode=detection_mode,
+                vision_stack=vision_stack,
+            )
+        except Exception as exc:
+            log.debug("deep-ocr variant %d failed: %s", i, exc)
+            continue
+        for plate, conf in plates or []:
+            candidates.append((plate, conf))
+            if expected_plate and _plates_close_enough(plate, expected_plate):
+                matched = (plate, conf)
+                break
+        if matched:
+            break
+
+    if not candidates:
+        log.info("deep-ocr [%s route=%s]: no plates from %d variants",
+                 camera_id, route or "?", len(_enhance_variants(frame)))
+        return
+
+    # Pick the registry-matching candidate when available, else the highest-conf.
+    if matched is None and candidates:
+        candidates.sort(key=lambda kv: kv[1], reverse=True)
+        matched = candidates[0]
+
+    plate, conf = matched
+    snap_b64 = None
+    try:
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        if ok:
+            import base64
+            snap_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+    except Exception:
+        pass
+
+    body: dict[str, Any] = {
+        "plate_text": plate,
+        "confidence": float(conf),
+        "camera_id": camera_id,
+        "camera_name": camera_name + " · enhanced",
+        "snapshot_base64": snap_b64,
+    }
+    if route:
+        body["detected_route"] = route
+    try:
+        client = _get_http_client()
+        r = client.post(
+            f"{api_base}/api/live/detections",
+            json=body,
+            headers={"X-Internal-Token": secret},
+        )
+        r.raise_for_status()
+        log.info(
+            "deep-ocr [%s] POSTED plate=%s conf=%.2f route=%s registry_match=%s",
+            camera_id, plate, conf, route or "?", expected_plate or "?",
+        )
+    except Exception as exc:
+        log.warning("deep-ocr POST failed: %s", exc)
+
+
+def _enqueue_deep_ocr(
+    s: VisionSettings,
+    *,
+    snapshot_b64: str | None,
+    camera_id: str,
+    camera_name: str,
+    route: str | None,
+    expected_plate: str | None,
+) -> None:
+    """Kick off a heavy retry on the snapshot. Cheap to call (queue submit)."""
+    if not snapshot_b64:
+        return
+    if not _deep_ocr_dedupe_allow(camera_id, route):
+        return
+    try:
+        import base64
+        snap_bytes = base64.b64decode(snapshot_b64)
+    except Exception:
+        return
+    pool = _get_deep_ocr_pool()
+    pool.submit(
+        _deep_ocr_worker,
+        s.API_BASE_URL.rstrip("/"),
+        s.INTERNAL_INGEST_SECRET,
+        snap_bytes,
+        camera_id,
+        camera_name,
+        route,
+        expected_plate,
+        s.MIN_CONFIDENCE,
+        s.PLATE_FILTER.strip().lower() == "indian",
+        s.PLATE_DETECTION_MODE.strip().lower(),
+        s.VISION_STACK,
+    )
+
+
+def _registry_plate_for_route(s: VisionSettings, route: str) -> str | None:
+    """Best-effort registry lookup: GET the API for the registered plate of a route.
+    Used to give the deep-OCR worker a 'target' to verify against."""
+    if not route:
+        return None
+    try:
+        client = _get_http_client()
+        r = client.get(
+            f"{s.API_BASE_URL.rstrip('/')}/api/internal/vehicles-by-route",
+            params={"route": route},
+            headers={"X-Internal-Token": s.INTERNAL_INGEST_SECRET},
+            timeout=2.0,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, dict):
+                return (data.get("plate_number") or "").strip().upper() or None
+    except Exception as exc:
+        log.debug("registry lookup failed (non-fatal): %s", exc)
+    return None
+
+
 def _post_detection(
     s: VisionSettings,
     plate: str | None,
@@ -1234,6 +1483,18 @@ def run_rtsp_loop(
                             camera_id=cid, camera_name=cname, detected_route=route,
                         )
                         log.info("route post (priority): route=%s camera=%s", route, cid)
+                        # Background deep-OCR retry on this snapshot. The
+                        # registry plate (if any) is fetched async and used
+                        # as a verification target inside the worker.
+                        expected = _registry_plate_for_route(s, route)
+                        _enqueue_deep_ocr(
+                            s,
+                            snapshot_b64=snap,
+                            camera_id=cid,
+                            camera_name=cname,
+                            route=route,
+                            expected_plate=expected,
+                        )
 
                 # ── PLATE VOTING ────────────────────────────────────────────
                 for plate, conf in plates:
@@ -1508,6 +1769,15 @@ def run_webcam_loop(
                             camera_id=cid, camera_name=cname, detected_route=route,
                         )
                         log.info("route post (webcam, priority): route=%s camera=%s", route, cid)
+                        expected = _registry_plate_for_route(s, route)
+                        _enqueue_deep_ocr(
+                            s,
+                            snapshot_b64=snap,
+                            camera_id=cid,
+                            camera_name=cname,
+                            route=route,
+                            expected_plate=expected,
+                        )
 
                 for plate, conf in plates:
                     if conf < INGEST_CONF_FLOOR:

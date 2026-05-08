@@ -32,7 +32,8 @@ _OSD_BOT_FRAC = 0.16    # bottom 16% of frame height (Hikvision camera name — 
 # ---------------------------------------------------------------------------
 # COCO class IDs for vehicles (only used when running a COCO-pretrained model)
 _COCO_VEHICLE_CLASSES = {2, 3, 5, 7}  # 2=car, 3=motorcycle, 5=bus, 7=truck
-_VEHICLE_CONF = 0.18  # lowered further — distant/blurry buses still need to be caught
+_VEHICLE_CONF = 0.10  # very low — gate cameras see distant/angled buses; we'd rather
+                       # over-detect (and let OSD/size filters reject noise) than miss a bus.
 
 _YOLO_AVAILABLE = False
 try:

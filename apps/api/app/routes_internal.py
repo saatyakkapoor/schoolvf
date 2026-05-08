@@ -6,9 +6,22 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from apps.api.app.db.models import AppCamera
+from apps.api.app.db.models import AppCamera, AppVehicle
 from apps.api.app.db.session import get_db
 from apps.api.app.settings import get_api_settings
+
+
+def _normalize_route(raw: str) -> str:
+    cleaned = (raw or "").strip().upper().replace(" ", "").replace("_", "")
+    if not cleaned:
+        return ""
+    if cleaned.startswith("AR-") and cleaned[3:].isdigit():
+        return f"AR-{int(cleaned[3:]):02d}"
+    if cleaned.startswith("AR") and cleaned[2:].isdigit():
+        return f"AR-{int(cleaned[2:]):02d}"
+    if cleaned.isdigit():
+        return f"AR-{int(cleaned):02d}"
+    return cleaned
 
 router = APIRouter()
 
@@ -53,3 +66,45 @@ def list_vision_cameras(
             )
         )
     return out
+
+
+class VehicleByRouteItem(BaseModel):
+    plate_number: str
+    route_number: str
+    route_name: str
+    driver_name: str
+
+
+@router.get("/internal/vehicles-by-route", response_model=VehicleByRouteItem | None)
+def get_vehicle_by_route(
+    route: str,
+    db: Session = Depends(get_db),
+    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+) -> VehicleByRouteItem | None:
+    """Look up the registered vehicle for a route number. Used by the vision
+    worker's deep-OCR enhancer to verify a re-OCR'd plate against the
+    registry. Returns null when no active vehicle is registered for the route."""
+    settings = get_api_settings()
+    if not x_internal_token or x_internal_token != settings.INTERNAL_INGEST_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid internal token")
+    canon = _normalize_route(route)
+    if not canon:
+        return None
+    candidates = [route.strip().upper(), canon]
+    if canon.startswith("AR-"):
+        bare = canon[3:].lstrip("0") or canon[3:]
+        candidates.append(bare)
+    veh = (
+        db.query(AppVehicle)
+        .filter(AppVehicle.is_active.is_(True), AppVehicle.route_number.in_(candidates))
+        .order_by(AppVehicle.created_at.asc())
+        .first()
+    )
+    if veh is None:
+        return None
+    return VehicleByRouteItem(
+        plate_number=(veh.plate_number or "").strip().upper(),
+        route_number=(veh.route_number or "").strip().upper(),
+        route_name=veh.route_name or "",
+        driver_name=veh.driver_name or "",
+    )
