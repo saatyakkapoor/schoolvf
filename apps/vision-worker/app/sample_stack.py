@@ -823,13 +823,25 @@ def read_plates_sample_stack(
         if vehicles:
             log.info("vehicle-gated: %d vehicles found", len(vehicles))
             fh, fw = frame.shape[:2]
-            vehicles.sort(key=lambda v: v["confidence"], reverse=True)
+            # Pick the BIGGEST bbox in frame, not the highest-confidence one —
+            # the bus we want to read is the one closest to the camera, which
+            # is the one occupying the most pixels. Smaller cars / background
+            # vehicles are ignored.
+            vehicles.sort(
+                key=lambda v: (
+                    (v["bbox"][2] - v["bbox"][0]) * (v["bbox"][3] - v["bbox"][1])
+                ),
+                reverse=True,
+            )
 
             plate_yolo = det.plate_yolo  # license_plate_detector.pt
 
-            # Cap to 3 vehicles per frame — beyond that we're spending time
-            # on background traffic that almost certainly isn't the school bus.
-            for veh in vehicles[:3]:
+            # ONLY scan the closest (biggest) vehicle. The user explicitly
+            # described the pipeline as: detect bus → snapshot → plate
+            # detector inside the bus → OCR each plate box. Adding more
+            # vehicles per frame just creates backlog without finding more
+            # of "the" bus.
+            for veh in vehicles[:1]:
                 if ocr_calls >= OCR_BUDGET or merged:
                     # Either we've already found a plate or the budget is
                     # spent — stop scanning more vehicles this frame.

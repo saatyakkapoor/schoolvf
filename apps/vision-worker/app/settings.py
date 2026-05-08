@@ -176,14 +176,17 @@ class VisionSettings(BaseSettings):
     taller crop includes grille / high-mounted plates; max ~0.5). Was hardcoded 0.45."""
     PLATE_YOLO_MIN_CONF: float = 0.06
     """Min confidence for license_plate_detector.pt inside the bumper ROI (lower = more boxes, more OCR)."""
-    PLATE_OCR_BUDGET: int = 16
+    PLATE_OCR_BUDGET: int = 6
     """Max EasyOCR forward passes per frame in the sample stack (tight + 2-line crops count separately).
-    Bumped 10 → 16: with the multi-frame voter the extra passes get squashed
-    into one consensus winner, so the only cost is GPU time we weren't using."""
-    PLATE_OCR_TARGET_MIN_WIDTH: int = 960
+    Lowered 16 → 6: the previous number was burning too much CPU/GPU per
+    frame and creating live-feed backlog. With single-vehicle scanning + the
+    multi-frame voter, 6 calls is plenty: 1 plate YOLO + 2-3 OCR passes per
+    frame, voted across 5-10 frames per visit."""
+    PLATE_OCR_TARGET_MIN_WIDTH: int = 720
     """Upscale each plate ROI to at least this width before EasyOCR. Higher =
-    more GPU RAM + time but materially better character accuracy on sharp feeds.
-    Bumped 720 → 960 to push more pixels through the OCR network."""
+    more GPU time but better character accuracy on sharp feeds. 720 is the
+    sweet spot — 960 was making OCR slower than camera fps and creating
+    backlog."""
     SNAPSHOT_MAX_WIDTH: int = 960
     """Max width in px for the dashboard snapshot. 520 was destroying plate
     legibility — at typical capture distance a plate is ~60 px wide and
