@@ -32,14 +32,25 @@ COPY apps/__init__.py /app/apps/__init__.py
 COPY apps/vision-worker /app/apps/vision_worker
 
 # Bake the public license-plate YOLO weight into the image so the worker
-# never has to phone home on first start. Same URL the runtime
-# auto-downloader uses; if the download fails the build still succeeds
-# and the runtime will retry on every start until it gets through.
-RUN mkdir -p /app/apps/vision_worker/models && \
-    curl -fsSL --retry 3 --retry-delay 2 \
-      -o /app/apps/vision_worker/models/license_plate_detector.pt \
-      "https://huggingface.co/morsetechlab/yolov11-license-plate-detection/resolve/main/license-plate-finetune-v1n.pt" \
-      || echo "WARN: plate-model download failed at build time — runtime will retry"
+# never has to phone home on first start. The previous version of this
+# step ran curl unconditionally and *truncated* the existing file before
+# checking the network — a curl failure left a 0-byte file in the image
+# even when COPY had just placed a perfectly good 5 MB weight there.
+# Now we (a) keep the COPY'd file when it's already valid and (b) only
+# write to a temp path on download so a failed curl never clobbers a
+# good file.
+RUN set -e; \
+    mkdir -p /app/apps/vision_worker/models; \
+    DEST=/app/apps/vision_worker/models/license_plate_detector.pt; \
+    if [ -s "$DEST" ] && [ "$(stat -c%s "$DEST" 2>/dev/null || stat -f%z "$DEST")" -gt 1000000 ]; then \
+      echo "Plate model already present (from COPY) — skipping download"; \
+    else \
+      TMP="$DEST.tmp"; \
+      curl -fsSL --retry 3 --retry-delay 2 -o "$TMP" \
+        "https://huggingface.co/morsetechlab/yolov11-license-plate-detection/resolve/main/license-plate-finetune-v1n.pt" \
+        && mv "$TMP" "$DEST" \
+        || (rm -f "$TMP"; echo "WARN: plate-model download failed at build time — runtime will retry"); \
+    fi
 
 # Monorepo root only — never add /app/packages/shared alone (shadows stdlib names).
 ENV PYTHONPATH="/app"

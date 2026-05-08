@@ -57,52 +57,84 @@ except ImportError:
 _MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 
 
-_PLATE_MODEL_DOWNLOAD_URL = (
+# Multiple mirrors — first one that returns a >1 MB body wins. Some
+# corporate / school networks block HuggingFace; the GitHub mirror is
+# the proven fallback. A custom user-friendly URL can be injected via
+# the YOLO_PLATE_MODEL_URL env var (single URL, takes priority).
+_PLATE_MODEL_DOWNLOAD_URLS: tuple[str, ...] = (
     "https://huggingface.co/morsetechlab/yolov11-license-plate-detection"
-    "/resolve/main/license-plate-finetune-v1n.pt"
+    "/resolve/main/license-plate-finetune-v1n.pt",
+    "https://github.com/computervisioneng/automatic-number-plate-recognition-python-yolov8"
+    "/raw/main/license_plate_detector.pt",
 )
-"""Public single-class yolov11n license-plate detector hosted on
-HuggingFace by morsetechlab. ~5.4 MB, single class "License_Plate".
-Downloaded on first start if no local weight is found and baked into
-the Docker image at build time so the container also works offline."""
+"""Public single-class yolov11n license-plate detector. ~5-6 MB, single
+class "License_Plate". Downloaded on first start if no local weight is
+found and baked into the Docker image at build time so the container
+also works offline."""
 
 
 def _try_download_plate_model(target: Path) -> bool:
     """Best-effort fetch of a public license-plate YOLO weight.
 
-    Returns True if the file is now present on disk, False otherwise.
-    Failure modes (no internet, GitHub release missing, etc.) are
-    swallowed — the rest of the pipeline still works without a plate
-    detector, just less accurately. Logged loudly so the operator
-    notices.
+    Tries every mirror in `_PLATE_MODEL_DOWNLOAD_URLS` (or a single
+    `YOLO_PLATE_MODEL_URL` override) and returns True on the first one
+    whose body is >=1 MB. Failures are swallowed — the rest of the
+    pipeline still works without a plate detector, just less accurately.
     """
     if target.is_file() and target.stat().st_size > 1_000_000:
         return True
     target.parent.mkdir(parents=True, exist_ok=True)
-    log.warning(
-        "license_plate_detector.pt not found at %s — downloading from %s",
-        target, _PLATE_MODEL_DOWNLOAD_URL,
-    )
-    try:
-        import urllib.request
 
-        tmp = target.with_suffix(".pt.tmp")
-        with urllib.request.urlopen(_PLATE_MODEL_DOWNLOAD_URL, timeout=30) as resp:
-            data = resp.read()
-        if len(data) < 1_000_000:
-            log.warning("plate model download too small (%d bytes) — discarding", len(data))
-            return False
-        tmp.write_bytes(data)
-        tmp.replace(target)
-        log.warning("Plate model downloaded OK: %s (%d bytes)", target, target.stat().st_size)
-        return True
-    except Exception as exc:
+    override = (os.environ.get("YOLO_PLATE_MODEL_URL") or "").strip()
+    urls: tuple[str, ...] = (override,) if override else _PLATE_MODEL_DOWNLOAD_URLS
+
+    import urllib.request
+
+    last_exc: Exception | None = None
+    for url in urls:
         log.warning(
-            "Plate model auto-download failed (%s). Place a yolov8 plate weight at %s "
-            "for accurate detection. Falling back to OpenCV contour analysis on the bumper crop.",
-            exc, target,
+            "license_plate_detector.pt not found at %s — trying %s",
+            target, url,
         )
-        return False
+        try:
+            tmp = target.with_suffix(".pt.tmp")
+            # Some CDNs (HuggingFace, GitHub raw) 403 default urllib UA.
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; SchoolVF/1.0)",
+                    "Accept": "*/*",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = resp.read()
+            if len(data) < 1_000_000:
+                log.warning(
+                    "plate model download too small (%d bytes) from %s — trying next mirror",
+                    len(data), url,
+                )
+                continue
+            tmp.write_bytes(data)
+            tmp.replace(target)
+            log.warning(
+                "Plate model downloaded OK: %s (%d bytes) from %s",
+                target, target.stat().st_size, url,
+            )
+            return True
+        except Exception as exc:
+            last_exc = exc
+            log.warning("Plate model download failed from %s: %s — trying next mirror", url, exc)
+            continue
+
+    log.error(
+        "All plate model mirrors failed (last error: %s). "
+        "MANUAL FIX: download a yolov8/yolov11 license-plate .pt and place it at %s. "
+        "Set YOLO_PLATE_MODEL_URL=<your-url> to add a custom mirror, or "
+        "YOLO_PLATE_AUTODOWNLOAD=0 to silence this message. "
+        "Pipeline still runs (OpenCV contour fallback) — just less accurate.",
+        last_exc, target,
+    )
+    return False
 
 
 def _plate_model_path() -> Path | None:
