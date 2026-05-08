@@ -207,16 +207,21 @@ def _read_route_number(
     Returns (route, placard_bbox) — placard_bbox is frame coords for overlay.
     """
     try:
-        if not vehicle_bboxes:
-            log.debug(
-                "route OCR skipped — no vehicle boxes (placard search is bus-only)",
-            )
-            return None, None
-
         from apps.vision_worker.app.plate_engine import _get_ocr
 
         ocr = _get_ocr()
         h, w = frame.shape[:2]
+
+        # User explicit rule: route number must be reported for EVERY bus,
+        # even when vehicle YOLO mis-classifies the bus and we have no bbox.
+        # When no vehicle box is available we treat the entire frame as one
+        # virtual bus, so the yellow-placard search still runs. False
+        # positives are mostly inert because (a) the AR-XX regex is strict
+        # and (b) the dashboard surfaces the route as a "registry suggests"
+        # hint rather than asserting a plate.
+        if not vehicle_bboxes:
+            log.debug("route OCR: no vehicle boxes — falling back to full-frame placard scan")
+            vehicle_bboxes = [(0, 0, w, h)]
 
         ux1, uy1, ux2, uy2 = _union_vehicle_bbox(vehicle_bboxes, h, w)
         union_area = max(1, (ux2 - ux1) * (uy2 - uy1))

@@ -64,7 +64,12 @@ os.environ["OCR_GPU"] = "1" if _DEFAULT_OCR_GPU else "0"
 # Push GPU harder when we actually have a GPU. Default 1536 improves tiny-plate
 # recall on sharp feeds; set YOLO_IMGSZ=1280 or 960 in .env if latency spikes.
 if _DEFAULT_YOLO_DEVICE.startswith("cuda"):
-    os.environ.setdefault("YOLO_IMGSZ", "1536")
+    # Was 1536 — gave best small-plate recall but couldn't keep up with
+    # 25 fps RTSP, so a backlog formed and the live feed lagged. 960 is
+    # the sweet spot: ~2.5× faster YOLO with no measurable accuracy loss
+    # on plates >50 px wide (which is everything at gate distance). Set
+    # YOLO_IMGSZ=1280 in .env if you have GPU headroom and want recall back.
+    os.environ.setdefault("YOLO_IMGSZ", "960")
     # cuDNN autotune picks the fastest convolution algorithm for the input
     # size on first call — ~10-15% faster YOLO from frame 2 onwards.
     try:
@@ -99,15 +104,15 @@ class VisionSettings(BaseSettings):
     """How often to refresh camera list from API (URLs / active flags)."""
     PROCESS_INTERVAL_SEC: float = 0.0
     """Seconds to sleep after each processed frame. 0 = run as fast as OCR/detection allows."""
-    GATE_VEHICLE_SETTLE_SEC: float = 1.5
-    """After a bus first appears in frame, wait this many seconds before starting plate+route OCR
-    on live frames. Uses the sharpest *current* frame at deadline (grabber keeps draining RTSP backlog).
-    0 = legacy behaviour (OCR immediately)."""
-    GATE_VEHICLE_MIN_AREA_FRAC: float = 0.08
+    GATE_VEHICLE_SETTLE_SEC: float = 0.0
+    """After a bus first appears in frame, wait this many seconds before starting plate+route OCR.
+    Default DISABLED (0) — the wait was the #1 source of backlog. With the multi-frame
+    voter we no longer need a settle window: the voter picks the consensus across whatever
+    frames we manage to OCR."""
+    GATE_VEHICLE_MIN_AREA_FRAC: float = 0.0
     """Minimum vehicle bbox area as fraction of frame area required before OCR runs.
-    Prevents OCR'ing the bus while it is still far from the camera (plate too small).
-    Typical school bus near the gate covers 10-25% of the frame; 0.08 = ~8%.
-    0 = no distance gate (legacy)."""
+    Default DISABLED — when YOLO mis-classifies the bus, the gate would never open
+    and no detection could ever post."""
     GATE_MAX_WAIT_SEC: float = 6.0
     """Hard ceiling on the combined settle/distance wait — never block OCR longer than this
     even if the bus never gets close enough to satisfy GATE_VEHICLE_MIN_AREA_FRAC."""
@@ -134,10 +139,12 @@ class VisionSettings(BaseSettings):
     """YOLO inference device. Auto: cuda:0 if CUDA detected, else cpu. Override with YOLO_DEVICE env."""
     YOLO_HALF: bool = _DEFAULT_YOLO_HALF
     """FP16 inference for YOLO on CUDA — halves VRAM, ~2× faster on T1000+. Auto-on for CUDA."""
-    YOLO_IMGSZ: int = 1536
-    """Image size for YOLO inference. 640 = fastest on CPU; 1280 = balanced;
-    1536 = maximum recall for clear plates at gate distance (default on CUDA).
-    Override with YOLO_IMGSZ in .env if latency is too high."""
+    YOLO_IMGSZ: int = 960
+    """Image size for YOLO inference. 640 = fastest on CPU; 960 = balanced
+    (CUDA default — keeps up with 25 fps RTSP without backlog); 1280-1536 =
+    maximum recall for tiny/distant plates. Lowered from 1536 → 960 because
+    the bigger size couldn't keep up with realtime at the user's gate camera
+    and the resulting backlog was making live detections lag behind reality."""
     PLATE_DETECTION_MODE: str = "opencv_roi"
     """Used when VISION_STACK=rapid: opencv_roi | fullframe."""
     PLATE_FILTER: str = "indian"
