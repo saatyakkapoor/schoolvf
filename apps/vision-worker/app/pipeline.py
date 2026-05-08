@@ -1212,6 +1212,25 @@ def run_rtsp_loop(
                 INGEST_CONF_FLOOR = float(s.INGEST_MIN_CONFIDENCE)
                 if vboxes_dbg:
                     plate_voter.mark_vehicle_seen()
+
+                # ── ROUTE FIRST ─────────────────────────────────────────────
+                # Post the route the moment we see one, before the plate
+                # voter ripens. This guarantees every bus whose placard is
+                # visible shows up on the dashboard even if the plate is
+                # permanently unreadable from this angle. Repeats are
+                # suppressed purely by `_route_only_dedupe_allow` (per-camera
+                # +per-route window) so no extra in-visit flag is needed.
+                if route:
+                    if _route_only_dedupe_allow(route, cid, last, max(s.DEDUPE_SECONDS, 6.0)):
+                        if snap is None:
+                            snap = frame_to_jpeg_b64(annotated, s.SNAPSHOT_MAX_WIDTH)
+                        _post_detection(
+                            s, None, 0.0, snap or None,
+                            camera_id=cid, camera_name=cname, detected_route=route,
+                        )
+                        log.info("route post (priority): route=%s camera=%s", route, cid)
+
+                # ── PLATE VOTING ────────────────────────────────────────────
                 for plate, conf in plates:
                     if conf < INGEST_CONF_FLOOR:
                         log.info(
@@ -1225,7 +1244,6 @@ def run_rtsp_loop(
 
                 # Multi-frame voting: emit ONE consensus winner per visit.
                 voted = plate_voter.flush(force=False)
-                posted_any = False
                 if voted is not None:
                     v_plate, v_conf, v_snap, v_route = voted
                     if _dedupe_allow(v_plate, last, s.DEDUPE_SECONDS, v_route) \
@@ -1238,27 +1256,10 @@ def run_rtsp_loop(
                             camera_id=cid, camera_name=cname, detected_route=v_route,
                         )
                         _camera_cooldown_mark(v_plate, cid, recent_cam)
-                        posted_any = True
                         log.info(
                             "voted plate posted: %s conf=%.2f route=%s",
                             v_plate, v_conf, v_route or "?",
                         )
-
-                # Route-only fallback only fires when no vehicle is actively
-                # being voted on (avoids racing with the voter).
-                if (
-                    not posted_any
-                    and route
-                    and not plate_voter.has_data()
-                ):
-                    if _route_only_dedupe_allow(route, cid, last, max(s.DEDUPE_SECONDS, 6.0)):
-                        if snap is None:
-                            snap = frame_to_jpeg_b64(annotated, s.SNAPSHOT_MAX_WIDTH)
-                        _post_detection(
-                            s, None, 0.0, snap or None,
-                            camera_id=cid, camera_name=cname, detected_route=route,
-                        )
-                        log.info("route-only post: route=%s camera=%s (no plate this frame)", route, cid)
                 if s.PROCESS_INTERVAL_SEC > 0:
                     time.sleep(s.PROCESS_INTERVAL_SEC)
         finally:
@@ -1490,6 +1491,19 @@ def run_webcam_loop(
                 INGEST_CONF_FLOOR = float(s.INGEST_MIN_CONFIDENCE)
                 if vboxes_dbg:
                     plate_voter_wc.mark_vehicle_seen()
+
+                # Route-first: post the moment we see a placard, even if the
+                # plate is gibberish. Dedupe window prevents flooding.
+                if route:
+                    if _route_only_dedupe_allow(route, cid, last, max(s.DEDUPE_SECONDS, 6.0)):
+                        if snap is None:
+                            snap = frame_to_jpeg_b64(annotated, s.SNAPSHOT_MAX_WIDTH)
+                        _post_detection(
+                            s, None, 0.0, snap or None,
+                            camera_id=cid, camera_name=cname, detected_route=route,
+                        )
+                        log.info("route post (webcam, priority): route=%s camera=%s", route, cid)
+
                 for plate, conf in plates:
                     if conf < INGEST_CONF_FLOOR:
                         log.info(
@@ -1502,7 +1516,6 @@ def run_webcam_loop(
                     plate_voter_wc.add(plate, conf, snapshot=snap, route=route)
 
                 voted = plate_voter_wc.flush(force=False)
-                posted_any = False
                 if voted is not None:
                     v_plate, v_conf, v_snap, v_route = voted
                     if _dedupe_allow(v_plate, last, s.DEDUPE_SECONDS, v_route) \
@@ -1515,7 +1528,6 @@ def run_webcam_loop(
                             camera_id=cid, camera_name=cname, detected_route=v_route,
                         )
                         _camera_cooldown_mark(v_plate, cid, recent_cam)
-                        posted_any = True
                         log.info("voted plate (webcam): %s conf=%.2f", v_plate, v_conf)
 
                 # Route-only fallback (webcam path) — see RTSP loop for the rationale.
