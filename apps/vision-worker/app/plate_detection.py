@@ -183,14 +183,41 @@ class VehicleDetector:
             total_boxes = len(boxes)
             skipped_class = 0
             skipped_osd = 0
+            skipped_class_names: dict[str, int] = {}
+
+            # Two-pass class filter: first try the strict COCO vehicle list.
+            # If EVERY box is rejected (very common when yolov8s.pt sees a
+            # head-on bus and labels it 'person' / 'truck' depending on angle
+            # — happens on the user's gate camera), we fall back to accepting
+            # every class on the second pass. Tiny-size and OSD filters still
+            # apply, so people, traffic-light icons, and burn-in OSD text are
+            # still rejected. The fallback is logged loudly so the operator
+            # knows what happened.
+            strict_class_filter = bool(self._is_coco)
+            # Pre-scan to decide whether strict filtering would zero out the
+            # frame; if so, disable it for THIS detect() call.
+            if strict_class_filter:
+                vehicle_class_count = 0
+                for box in boxes:
+                    cls_id = int(box.cls[0].cpu().numpy())
+                    if cls_id in _COCO_VEHICLE_CLASSES:
+                        vehicle_class_count += 1
+                if vehicle_class_count == 0 and total_boxes > 0:
+                    strict_class_filter = False
+                    log.warning(
+                        "VehicleDetector: COCO filter would reject all %d boxes "
+                        "(model classified them as non-vehicles); accepting all "
+                        "classes for this frame so plate/route OCR can still run",
+                        total_boxes,
+                    )
 
             for box in boxes:
                 cls_id = int(box.cls[0].cpu().numpy())
 
-                # For COCO models, filter to vehicle classes only
-                # For custom models (KITTI etc), accept ALL classes — they're all vehicles
-                if self._is_coco and cls_id not in _COCO_VEHICLE_CLASSES:
+                if strict_class_filter and cls_id not in _COCO_VEHICLE_CLASSES:
                     skipped_class += 1
+                    cn = names.get(cls_id, f"cls{cls_id}")
+                    skipped_class_names[cn] = skipped_class_names.get(cn, 0) + 1
                     continue
 
                 x1, y1, x2, y2 = (int(v) for v in box.xyxy[0].cpu().numpy())
@@ -218,10 +245,17 @@ class VehicleDetector:
                     "class_name": class_name,
                 })
 
-            log.info(
-                "VehicleDetector: total_boxes=%d accepted=%d skipped_class=%d skipped_osd=%d",
-                total_boxes, len(detections), skipped_class, skipped_osd,
-            )
+            if skipped_class_names:
+                log.info(
+                    "VehicleDetector: total_boxes=%d accepted=%d skipped_class=%d skipped_osd=%d non_vehicle_classes=%s",
+                    total_boxes, len(detections), skipped_class, skipped_osd,
+                    skipped_class_names,
+                )
+            else:
+                log.info(
+                    "VehicleDetector: total_boxes=%d accepted=%d skipped_class=%d skipped_osd=%d",
+                    total_boxes, len(detections), skipped_class, skipped_osd,
+                )
             return detections
         except Exception as exc:
             log.warning("VehicleDetector.detect ERROR: %s", exc, exc_info=True)
