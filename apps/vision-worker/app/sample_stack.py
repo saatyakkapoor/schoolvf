@@ -1030,15 +1030,17 @@ def read_plates_sample_stack(
                                     new_plates = set(merged) - set(merged_before_tight)
                                     label = max(new_plates, key=len) if new_plates else None
                                     label_conf = merged.get(label or "", pconf) if label else pconf
-                                else:
-                                    label = _candidate_plate_overlay(pconf)
-                                    label_conf = None
-                                overlay_add_plate_region(
-                                    plate_abs_bbox,
-                                    text=label,
-                                    conf=float(label_conf) if label_conf is not None else None,
-                                    accepted=accepted,
-                                )
+                                    overlay_add_plate_region(
+                                        plate_abs_bbox,
+                                        text=label,
+                                        conf=float(label_conf) if label_conf is not None else None,
+                                        accepted=True,
+                                    )
+                                # No "no OCR match" box: on yellow buses the
+                                # detector hits dozens of stickers/body text
+                                # per frame and the user complained about
+                                # "every yellow region having a box". Only
+                                # validated Indian-format reads are drawn.
                     except Exception as e:
                         log.warning("  → plate YOLO on bumper crop failed: %s", e)
 
@@ -1087,15 +1089,11 @@ def read_plates_sample_stack(
                                 new_p = set(merged) - set(merged_before)
                                 lab = max(new_p, key=len) if new_p else None
                                 lab_conf = merged.get(lab or "", 0.0) if lab else None
-                            else:
-                                q = float(cand.get("quality_score") or 0.0)
-                                lab = _candidate_plate_overlay(q, note=" · contour")
-                                lab_conf = None
-                            overlay_add_plate_region(
-                                abs_box, text=lab,
-                                conf=lab_conf,
-                                accepted=accepted,
-                            )
+                                overlay_add_plate_region(
+                                    abs_box, text=lab,
+                                    conf=lab_conf,
+                                    accepted=True,
+                                )
                     except Exception as e:
                         log.warning("  → contour fallback failed: %s", e)
 
@@ -1119,12 +1117,9 @@ def read_plates_sample_stack(
                         new_p = set(merged) - set(merged_before)
                         lab = max(new_p, key=len) if new_p else None
                         lab_conf = merged.get(lab or "", 0.0) if lab else None
-                    else:
-                        lab = _candidate_plate_overlay(0.40, note=" · bumper crop")
-                        lab_conf = None
-                    overlay_add_plate_region(
-                        bumper_abs_box, text=lab, conf=lab_conf, accepted=accepted,
-                    )
+                        overlay_add_plate_region(
+                            bumper_abs_box, text=lab, conf=lab_conf, accepted=True,
+                        )
 
             if merged:
                 log.info("vehicle-gated FOUND: %s (ocr_calls=%d)", list(merged.keys()), ocr_calls)

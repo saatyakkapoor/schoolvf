@@ -35,13 +35,16 @@ def _annotate_frame(
     image the dashboard receives shows what was detected.
     """
     boxes: list = list(plate_boxes or [])
-    if placard_bbox is not None:
-        # placard_bbox = (x1, y1, x2, y2, conf)
+    # Only draw the placard box when we actually OCR'd a route. Drawing
+    # an unlabeled "placard" rectangle on every frame just because a
+    # yellow region was found pollutes the snapshot — every school-bus
+    # sticker, paint stripe, or LED panel ends up boxed.
+    if placard_bbox is not None and route_text:
         try:
             x1, y1, x2, y2, pconf = placard_bbox
             boxes.append(make_route_box(
                 (x1, y1, x2, y2),
-                text=route_text or "placard",
+                text=route_text,
                 conf=float(pconf) if pconf else None,
             ))
         except Exception:
