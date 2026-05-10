@@ -17,11 +17,33 @@ RUN apt-get update && \
 
 # sample.txt stack: CPU PyTorch first, then ultralytics + easyocr + rest
 COPY apps/vision-worker/requirements.txt ./requirements.txt
+ENV PIP_DEFAULT_TIMEOUT=300 \
+    PIP_RETRIES=10 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Shell-level retry loop: pip's own --retries doesn't recover from
+# IncompleteRead (TCP stream dropped mid-wheel). Each attempt restarts
+# the download cleanly.
 RUN pip install --no-cache-dir --upgrade "pip>=24.0" "setuptools>=68" "wheel>=0.42" && \
-    pip install --no-cache-dir --retries 5 --timeout 60 \
-        torch torchvision --index-url https://download.pytorch.org/whl/cpu && \
-    pip install --no-cache-dir --retries 5 --timeout 60 \
-        --index-url https://pypi.org/simple/ -r requirements.txt
+    set -e; \
+    n=0; \
+    until [ $n -ge 6 ]; do \
+      pip install --no-cache-dir --prefer-binary \
+          torch torchvision --index-url https://download.pytorch.org/whl/cpu && break; \
+      n=$((n+1)); \
+      echo "torch install failed (attempt $n/6) — sleeping ${n}0s"; \
+      sleep $((n * 10)); \
+    done; \
+    [ $n -lt 6 ] || (echo "torch install failed after 6 attempts" && exit 1); \
+    n=0; \
+    until [ $n -ge 6 ]; do \
+      pip install --no-cache-dir --prefer-binary \
+          --index-url https://pypi.org/simple/ -r requirements.txt && break; \
+      n=$((n+1)); \
+      echo "requirements install failed (attempt $n/6) — sleeping ${n}0s"; \
+      sleep $((n * 10)); \
+    done; \
+    [ $n -lt 6 ] || (echo "requirements install failed after 6 attempts" && exit 1)
 
 # Copy shared packages
 COPY packages/__init__.py /app/packages/__init__.py

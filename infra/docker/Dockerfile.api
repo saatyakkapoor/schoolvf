@@ -6,19 +6,30 @@ WORKDIR /build
 
 COPY apps/api/requirements.txt ./requirements.txt
 
-# Upgrade pip first — older pip + PyPI's CDN occasionally serve a wheel
-# whose sha256 doesn't match the index, surfacing as
-# "THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE".
-# --retries / --timeout absorb transient CDN flakes without failing the
-# whole build. We pin to PyPI directly to avoid mirror rewrites.
+# Network resiliency: pip's --retries only retries the *request*, not the
+# bytes already in flight. Flaky networks/CDNs drop the TCP stream
+# mid-wheel and pip aborts with IncompleteRead. We wrap the install in a
+# shell loop so a partial download just restarts cleanly. Long timeout +
+# direct PyPI index avoids mirror rewrites and slow-CDN false-aborts.
+ENV PIP_DEFAULT_TIMEOUT=300 \
+    PIP_RETRIES=10 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
 RUN pip install --no-cache-dir --upgrade "pip>=24.0" "setuptools>=68" "wheel>=0.42" \
-    && pip install \
-        --no-cache-dir \
-        --prefix=/install \
-        --retries 5 \
-        --timeout 60 \
-        --index-url https://pypi.org/simple/ \
-        -r requirements.txt
+    && set -e; \
+       n=0; \
+       until [ $n -ge 6 ]; do \
+         pip install \
+             --no-cache-dir \
+             --prefix=/install \
+             --prefer-binary \
+             --index-url https://pypi.org/simple/ \
+             -r requirements.txt && break; \
+         n=$((n+1)); \
+         echo "pip install failed (attempt $n/6) — sleeping ${n}0s before retry"; \
+         sleep $((n * 10)); \
+       done; \
+       [ $n -lt 6 ] || (echo "pip install failed after 6 attempts" && exit 1)
 
 # ---------- Stage 2: Runtime ----------
 FROM public.ecr.aws/docker/library/python:3.11-slim AS runtime

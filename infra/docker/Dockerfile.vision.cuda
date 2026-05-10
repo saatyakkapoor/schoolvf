@@ -48,12 +48,31 @@ RUN apt-get update && \
 
 # CUDA-enabled PyTorch. cu121 matches the base image (12.1.1).
 COPY apps/vision-worker/requirements.txt ./requirements.txt
-RUN python -m pip install --upgrade "pip>=24.0" "setuptools>=68" "wheel>=0.42" \
-    && python -m pip install --retries 5 --timeout 60 \
-        torch==2.4.1 torchvision==0.19.1 \
-        --index-url https://download.pytorch.org/whl/cu121 \
-    && python -m pip install --retries 5 --timeout 60 \
-        --index-url https://pypi.org/simple/ -r requirements.txt
+ENV PIP_DEFAULT_TIMEOUT=300 \
+    PIP_RETRIES=10 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN python -m pip install --upgrade "pip>=24.0" "setuptools>=68" "wheel>=0.42" && \
+    set -e; \
+    n=0; \
+    until [ $n -ge 6 ]; do \
+      python -m pip install --prefer-binary \
+          torch==2.4.1 torchvision==0.19.1 \
+          --index-url https://download.pytorch.org/whl/cu121 && break; \
+      n=$((n+1)); \
+      echo "torch (cu121) install failed (attempt $n/6) — sleeping ${n}0s"; \
+      sleep $((n * 10)); \
+    done; \
+    [ $n -lt 6 ] || (echo "torch install failed after 6 attempts" && exit 1); \
+    n=0; \
+    until [ $n -ge 6 ]; do \
+      python -m pip install --prefer-binary \
+          --index-url https://pypi.org/simple/ -r requirements.txt && break; \
+      n=$((n+1)); \
+      echo "requirements install failed (attempt $n/6) — sleeping ${n}0s"; \
+      sleep $((n * 10)); \
+    done; \
+    [ $n -lt 6 ] || (echo "requirements install failed after 6 attempts" && exit 1)
 
 COPY packages/__init__.py /app/packages/__init__.py
 COPY packages/shared /app/packages/shared
