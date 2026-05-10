@@ -17,8 +17,11 @@ RUN apt-get update && \
 
 # sample.txt stack: CPU PyTorch first, then ultralytics + easyocr + rest
 COPY apps/vision-worker/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu && \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade "pip>=24.0" "setuptools>=68" "wheel>=0.42" && \
+    pip install --no-cache-dir --retries 5 --timeout 60 \
+        torch torchvision --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir --retries 5 --timeout 60 \
+        --index-url https://pypi.org/simple/ -r requirements.txt
 
 # Copy shared packages
 COPY packages/__init__.py /app/packages/__init__.py

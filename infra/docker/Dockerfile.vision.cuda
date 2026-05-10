@@ -48,11 +48,12 @@ RUN apt-get update && \
 
 # CUDA-enabled PyTorch. cu121 matches the base image (12.1.1).
 COPY apps/vision-worker/requirements.txt ./requirements.txt
-RUN python -m pip install --upgrade pip wheel \
-    && python -m pip install \
+RUN python -m pip install --upgrade "pip>=24.0" "setuptools>=68" "wheel>=0.42" \
+    && python -m pip install --retries 5 --timeout 60 \
         torch==2.4.1 torchvision==0.19.1 \
         --index-url https://download.pytorch.org/whl/cu121 \
-    && python -m pip install -r requirements.txt
+    && python -m pip install --retries 5 --timeout 60 \
+        --index-url https://pypi.org/simple/ -r requirements.txt
 
 COPY packages/__init__.py /app/packages/__init__.py
 COPY packages/shared /app/packages/shared

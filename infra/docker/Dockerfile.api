@@ -6,7 +6,19 @@ WORKDIR /build
 
 COPY apps/api/requirements.txt ./requirements.txt
 
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+# Upgrade pip first — older pip + PyPI's CDN occasionally serve a wheel
+# whose sha256 doesn't match the index, surfacing as
+# "THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE".
+# --retries / --timeout absorb transient CDN flakes without failing the
+# whole build. We pin to PyPI directly to avoid mirror rewrites.
+RUN pip install --no-cache-dir --upgrade "pip>=24.0" "setuptools>=68" "wheel>=0.42" \
+    && pip install \
+        --no-cache-dir \
+        --prefix=/install \
+        --retries 5 \
+        --timeout 60 \
+        --index-url https://pypi.org/simple/ \
+        -r requirements.txt
 
 # ---------- Stage 2: Runtime ----------
 FROM public.ecr.aws/docker/library/python:3.11-slim AS runtime
