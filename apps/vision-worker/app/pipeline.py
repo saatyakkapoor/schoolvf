@@ -88,10 +88,31 @@ def _sharpen_roi(roi: "np.ndarray", strength: float = 1.5) -> "np.ndarray":
     return cv2.addWeighted(roi, 1.0 + strength, blur, -strength, 0)
 
 
-_ROUTE_OCR_MIN_CONF: float = 0.50
+_ROUTE_OCR_MIN_CONF: float = 0.62
 """Minimum RapidOCR confidence for a route candidate to even be considered.
 Below this we get spurious hits like 'AR-02' / 'AR-06' / 'AR-51' from
-random bus body text. The user wants nothing under 50% to surface."""
+random bus body text and potted plants. Bumped 0.50 → 0.62 after user
+reported a potted plant matching 'AR-93' at ~0.55 conf."""
+
+# Hard cap on real Aravali routes. The fleet operates AR-01 .. AR-60.
+# Any OCR hit outside this range is mathematically a hallucination —
+# typically a 2-digit fragment of a phone number, a bus body code, or
+# a stray leaf reading as "93". Reject silently rather than display.
+# Override via env: ROUTE_MIN_NUM / ROUTE_MAX_NUM.
+try:
+    _ROUTE_MIN_NUM: int = int(os.environ.get("ROUTE_MIN_NUM", "1"))
+    _ROUTE_MAX_NUM: int = int(os.environ.get("ROUTE_MAX_NUM", "60"))
+except ValueError:
+    _ROUTE_MIN_NUM = 1
+    _ROUTE_MAX_NUM = 60
+
+# Confidence threshold for an instant single-frame lock. When OCR is this
+# sure AND the regex was the strict AR-XX form (not bare digits), we trust
+# the read and skip the 2-frame consensus wait. Tunable via env.
+try:
+    _ROUTE_HIGH_CONF: float = float(os.environ.get("ROUTE_HIGH_CONF", "0.85"))
+except ValueError:
+    _ROUTE_HIGH_CONF = 0.85
 
 
 def _union_vehicle_bbox(
@@ -143,6 +164,8 @@ def _ocr_scan_for_route(
     """
     best: str | None = None
     best_score: float = 0.0
+    best_conf: float = 0.0
+    best_was_strict: bool = False
     for line in ocr_result:
         if len(line) < 2:
             continue
@@ -160,15 +183,20 @@ def _ocr_scan_for_route(
                 label, raw, ocr_conf, _ROUTE_OCR_MIN_CONF,
             )
             continue
-        m = (_PLACARD_RE.search(raw)
-             or _LED_RE.search(raw)
-             or _PLACARD_LOOSE_RE.search(raw))
+        m_strict = _PLACARD_RE.search(raw) or _LED_RE.search(raw)
+        m = m_strict or _PLACARD_LOOSE_RE.search(raw)
         if not m and allow_bare_number:
             m = _ROUTE_NUM_RE.match(raw)
         if not m:
             continue
+        is_strict_match = m_strict is not None
         route_num = int(m.group(1))
-        if route_num < 1 or route_num > 99:
+        if route_num < _ROUTE_MIN_NUM or route_num > _ROUTE_MAX_NUM:
+            # Fleet operates AR-01..AR-60. Anything outside is OCR noise.
+            log.info(
+                "route OCR [%s] reject out-of-range raw='%s' n=%d (allowed %d..%d)",
+                label, raw, route_num, _ROUTE_MIN_NUM, _ROUTE_MAX_NUM,
+            )
             continue
         route_str = f"AR-{route_num:02d}"
         area = 1.0
@@ -188,6 +216,15 @@ def _ocr_scan_for_route(
         if score > best_score:
             best_score = score
             best = route_str
+            best_conf = ocr_conf
+            best_was_strict = is_strict_match
+    # Stash high-confidence flag on the module so the loop can fast-lock
+    # without changing the public return signature.
+    _ocr_scan_for_route.last_was_high_conf = (
+        best is not None
+        and best_was_strict
+        and best_conf >= _ROUTE_HIGH_CONF
+    )
     return best, best_score
 
 
@@ -258,11 +295,9 @@ def _read_route_number(
         bus_area = float(np.count_nonzero(bus_mask)) or 1.0
         yellow_frac = float(np.count_nonzero(yellow_inside_bus)) / bus_area
         is_yellow_body = yellow_frac > 0.35
-        # On yellow-body buses the placard is identified by the AR-XX
-        # text only, never by being "the yellow rectangle". Bare numbers
-        # are too false-prone (every "5", "12", or sticker digit becomes
-        # a route).
-        allow_bare = not is_yellow_body
+        # Bare numbers are NEVER accepted now — every "5", "12", sticker
+        # digit, or potted plant fragment used to become a route. Strict
+        # AR-XX prefix is required everywhere. `allow_bare` removed.
         if is_yellow_body:
             log.debug("route OCR: yellow-body bus (yellow_frac=%.2f) — strict AR-XX only", yellow_frac)
 
@@ -272,7 +307,7 @@ def _read_route_number(
         # `_EARLY_EXIT_SCORE` short-circuits the cascade as soon as any pass
         # produces a high-confidence match — saves 2 OCR calls per frame
         # in the common case where the placard is in the most-likely band.
-        candidates: list[tuple[str, float, str]] = []  # (route, score, source)
+        candidates: list[tuple[str, float, str, bool]] = []  # (route, score, source, high_conf)
         _EARLY_EXIT_SCORE = 1500.0  # ~AR-XX read at 0.85 conf in a 50×80 px placard
 
         def _early_exit() -> bool:
@@ -304,8 +339,9 @@ def _read_route_number(
             if not result:
                 return
             r, a = _ocr_scan_for_route(result, label, allow_bare_number=allow_bare_for_pass)
+            high_conf = bool(getattr(_ocr_scan_for_route, "last_was_high_conf", False))
             if r and a > 0:
-                candidates.append((r, a, label))
+                candidates.append((r, a, label, high_conf))
             # Maintain the placard_bbox using the most-confident pass that hit.
             nonlocal placard_bbox
             if r and a > 0 and (placard_bbox is None or a > placard_bbox[4]):
@@ -354,7 +390,13 @@ def _read_route_number(
                     "yellow_mask",
                     bx - pad_x, by - pad_y, bx + bw + pad_x, by + bh + pad_y,
                     upscale=3.0, sharpen=1.8,
-                    allow_bare_for_pass=allow_bare,
+                    # FORCE strict AR-XX matching. Bare-number matching on
+                    # the yellow_mask contour was the root cause of the
+                    # "potted plant → AR-93" false positives — any
+                    # 1-2 digit OCR fragment on a yellow-ish region was
+                    # being promoted to a route. We always require the
+                    # literal "AR" prefix now.
+                    allow_bare_for_pass=False,
                 )
 
         # ------------------------------------------------------------------ #
@@ -384,14 +426,21 @@ def _read_route_number(
         # Pick the highest-scoring candidate across all passes.
         if candidates:
             candidates.sort(key=lambda c: c[1], reverse=True)
-            best_route, best_area, src = candidates[0]
+            best_route, best_area, src, best_high_conf = candidates[0]
             log.info(
-                "route OCR winner: %s score=%.0f source=%s (yellow_body=%s, %d passes hit)",
-                best_route, best_area, src, is_yellow_body, len(candidates),
+                "route OCR winner: %s score=%.0f source=%s high_conf=%s (yellow_body=%s, %d passes hit)",
+                best_route, best_area, src, best_high_conf, is_yellow_body, len(candidates),
             )
+            # Surface the high-conf flag on a function attribute so the
+            # cache-lock loop can fast-lock without changing the public
+            # tuple signature (which several callers unpack).
+            _read_route_number.last_was_high_conf = bool(best_high_conf)
+        else:
+            _read_route_number.last_was_high_conf = False
         return best_route, placard_bbox
     except Exception as exc:
         log.warning("route OCR exception: %s", exc)
+    _read_route_number.last_was_high_conf = False
     return None, None
 
 log = logging.getLogger("vision.pipeline")
@@ -1313,7 +1362,12 @@ def run_rtsp_loop(
             # winning route string until the vehicle leaves the gate; this
             # is the single biggest live-mode speedup since route OCR is
             # responsible for ~3 OCR forward passes per frame.
-            route_cache: dict[str, Any] = {"value": None}
+            #
+            # IMPORTANT: we only lock AFTER two consecutive frames agree on
+            # the same route. Locking on the first hit was burning bad reads
+            # in for the whole visit — e.g. a potted plant misread as
+            # "AR-93" would stay on screen until the bus left.
+            route_cache: dict[str, Any] = {"value": None, "candidate": None, "candidate_hits": 0}
             # Heavy route OCR every Nth frame even when the cache is empty —
             # the placard may not be readable in every frame (motion blur,
             # angle), so retrying every frame is wasteful. Voter still sees
@@ -1479,16 +1533,36 @@ def run_rtsp_loop(
                     route, placard_bbox = _route_fut.result(timeout=1.0)
                 except Exception as _re:
                     log.debug("route OCR timeout/error: %s", _re)
-                # Lock the route for this visit. Subsequent frames skip the
-                # heavy 3-pass cascade and reuse this string.
+                # Lock the route for this visit.
+                #   • Fast-lock on a SINGLE frame if the OCR was very confident
+                #     AND the regex required the literal "AR" prefix
+                #     (high_conf flag). Real placards at the gate hit ≥0.85.
+                #   • Otherwise wait for 2-frame consensus, to avoid burning
+                #     a bad single-frame read in for the whole visit.
+                high_conf_read = bool(getattr(_read_route_number, "last_was_high_conf", False))
                 if route and route_cache.get("value") is None:
-                    route_cache["value"] = route
-                    log.info("route locked for visit on cam %s: %s", cid, route)
+                    if high_conf_read:
+                        route_cache["value"] = route
+                        log.info("route locked for visit on cam %s: %s (fast-lock, conf≥%.2f)",
+                                 cid, route, _ROUTE_HIGH_CONF)
+                    elif route_cache.get("candidate") == route:
+                        route_cache["candidate_hits"] = route_cache.get("candidate_hits", 1) + 1
+                        if route_cache["candidate_hits"] >= 2:
+                            route_cache["value"] = route
+                            log.info("route locked for visit on cam %s: %s (2 frame consensus)", cid, route)
+                    else:
+                        route_cache["candidate"] = route
+                        route_cache["candidate_hits"] = 1
+                        # Don't surface this single-frame read yet.
+                        route = None
                 # Clear the lock when no vehicles are present for this frame
                 # AND we already have a previous lock — that means the bus
                 # left the gate and the next arrival should re-OCR.
-                if not current.get("vehicle_boxes") and route_cache.get("value"):
-                    route_cache["value"] = None
+                if not current.get("vehicle_boxes"):
+                    if route_cache.get("value"):
+                        route_cache["value"] = None
+                    route_cache["candidate"] = None
+                    route_cache["candidate_hits"] = 0
                 ocr_ms = int((time.time() - t_ocr) * 1000)
                 # ─────────────────────────────────────────────────────────────
 
@@ -1678,7 +1752,7 @@ def run_webcam_loop(
             plate_voter_wc = _PlateVoter(min_votes=2, max_age_sec=2.5,
                                          visit_end_grace_sec=2.0)
             # Per-visit route cache (see RTSP loop for rationale).
-            route_cache_wc: dict[str, Any] = {"value": None}
+            route_cache_wc: dict[str, Any] = {"value": None, "candidate": None, "candidate_hits": 0}
             _ROUTE_OCR_EVERY_WC = 2
             route_ocr_frame_n_wc = {"counter": 0}
 
@@ -1824,11 +1898,26 @@ def run_webcam_loop(
                     route, placard_bbox = _route_fut.result(timeout=1.0)
                 except Exception as _re:
                     log.debug("route OCR timeout/error: %s", _re)
+                high_conf_read_wc = bool(getattr(_read_route_number, "last_was_high_conf", False))
                 if route and route_cache_wc.get("value") is None:
-                    route_cache_wc["value"] = route
-                    log.info("route locked for visit on cam %s: %s", cid, route)
-                if not current.get("vehicle_boxes") and route_cache_wc.get("value"):
-                    route_cache_wc["value"] = None
+                    if high_conf_read_wc:
+                        route_cache_wc["value"] = route
+                        log.info("route locked for visit on cam %s: %s (fast-lock, conf≥%.2f)",
+                                 cid, route, _ROUTE_HIGH_CONF)
+                    elif route_cache_wc.get("candidate") == route:
+                        route_cache_wc["candidate_hits"] = route_cache_wc.get("candidate_hits", 1) + 1
+                        if route_cache_wc["candidate_hits"] >= 2:
+                            route_cache_wc["value"] = route
+                            log.info("route locked for visit on cam %s: %s (2 frame consensus)", cid, route)
+                    else:
+                        route_cache_wc["candidate"] = route
+                        route_cache_wc["candidate_hits"] = 1
+                        route = None
+                if not current.get("vehicle_boxes"):
+                    if route_cache_wc.get("value"):
+                        route_cache_wc["value"] = None
+                    route_cache_wc["candidate"] = None
+                    route_cache_wc["candidate_hits"] = 0
                 ocr_ms = int((time.time() - t_ocr) * 1000)
                 # ─────────────────────────────────────────────────────────────
 
